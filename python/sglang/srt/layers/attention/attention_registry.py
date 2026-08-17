@@ -494,3 +494,10 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("tpu")
+def create_tpu_backend(runner):
+    from sglang.srt.hardware_backend.tpu.attention import TpuAttnBackend
+
+    return TpuAttnBackend(runner)

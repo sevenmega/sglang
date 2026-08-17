@@ -202,6 +202,9 @@ vsa = ["setuptools", "torch"]
 sglang = "sglang.cli.main:main"
 killall_sglang = "sglang.cli.killall:main"
 
+[project.entry-points."sglang.srt.platforms"]
+tpu = "sglang.srt.platforms.tpu:activate"
+
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",

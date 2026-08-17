@@ -22,6 +22,7 @@ from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
+from sglang.srt.platforms.tpu import TpuSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
 
@@ -44,6 +45,12 @@ def _is_cpu_available() -> bool:
 
 def _is_xpu_available() -> bool:
     return torch.xpu.is_available()
+
+
+def _is_tpu_available() -> bool:
+    return os.getenv("SGLANG_USE_TPU", "0") == "1" or bool(
+        os.environ.get("PPL_PROJECT_ROOT")
+    )
 
 
 def _resolve_platform() -> SRTPlatform:
@@ -122,6 +129,12 @@ def _resolve_platform() -> SRTPlatform:
         if _is_cpu_available():
             logger.debug("SGLANG_USE_CPU_ENGINE=1. Using CPU SRTPlatform defaults.")
             return CpuSRTPlatform()
+        if _is_tpu_available():
+            logger.debug(
+                "TPU platform detected (SGLANG_USE_TPU=1 or PPL_PROJECT_ROOT set). "
+                "Using TPU SRTPlatform defaults."
+            )
+            return TpuSRTPlatform()
         if _is_cuda_available():
             logger.debug(
                 "No platform plugin detected. Using CUDA SRTPlatform defaults."
