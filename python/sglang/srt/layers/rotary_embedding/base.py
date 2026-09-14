@@ -21,6 +21,7 @@ from sglang.srt.utils import (
     is_mps,
     is_musa,
     is_npu,
+    is_tpu,
     is_xpu,
 )
 
@@ -40,6 +41,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_mps = is_mps()
+_is_tpu = is_tpu()
 
 if _is_cuda:
     from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
@@ -107,6 +109,7 @@ class RotaryEmbedding(BaseFusedOp):
             and not (_is_npu)
             and not (_is_musa)
             and not (_is_mps)
+            and not (_is_tpu)
             and not (current_platform.is_out_of_tree())
         ):
             # rotary_embedding from sglang.kernels.ops.attention.rope and vllm._custom_ops has the same implementation.
@@ -243,6 +246,11 @@ class RotaryEmbedding(BaseFusedOp):
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for native implementation"
+
+        # When dispatched directly (e.g. the TPU fused-op path) this bypasses
+        # the wrapper that co-locates the cache, leaving cos_sin_cache on its
+        # init device (CPU) while query is on the accelerator. Match it here.
+        self._match_cos_sin_cache_dtype(query)
 
         if offsets is not None:
             positions = positions + offsets

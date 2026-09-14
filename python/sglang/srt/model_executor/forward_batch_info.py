@@ -28,6 +28,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import itertools
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -56,6 +57,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_tpu,
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
@@ -1791,28 +1793,62 @@ def compute_position(
 def compute_position_torch(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
 ):
+    # Pull lengths to host once and do all range/offset arithmetic in Python.
+    # Building the ranges on the device (per-element arange with device-tensor
+    # bounds, and the `prefix_len + extend_len` add) is both slow and, on some
+    # accelerators (Sophgo TPU), numerically unreliable for small int ops — the
+    # on-device add can yield an inconsistent (start > stop) arange bound.
+    device = extend_prefix_lens.device
+    prefix_lens = extend_prefix_lens.tolist()
+    seq_lens = extend_seq_lens.tolist()
+
+    # Build the int64 range on host, then move once. On CUDA this stays int64
+    # (the historical dtype); on accelerators that reject int64 (Sophgo TPU) the
+    # host->device copy materializes int32, which is what index ops consume. Do
+    # NOT re-cast to int64 on-device afterwards: an on-device int32->int64
+    # upcast is unsupported there and corrupts the tensor's metadata.
     positions = torch.cat(
         [
-            torch.arange(
-                prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device
-            )
-            for prefix_len, extend_len in zip(extend_prefix_lens, extend_seq_lens)
+            torch.arange(prefix_len, prefix_len + extend_len, dtype=torch.int64)
+            for prefix_len, extend_len in zip(prefix_lens, seq_lens)
         ],
         axis=0,
-    )
+    ).to(device, non_blocking=True)
+
     extend_start_loc = torch.zeros_like(extend_seq_lens)
-    extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
-    return positions.to(torch.int64), extend_start_loc
+    if len(seq_lens) > 1:
+        starts = torch.tensor(
+            list(itertools.accumulate(seq_lens[:-1])),
+            dtype=extend_seq_lens.dtype,
+        ).to(device, non_blocking=True)
+        extend_start_loc[1:] = starts
+    return positions, extend_start_loc
 
 
 def _clamp_position_native(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 
+def _clamp_position_tpu(seq_lens):
+    # On this Sophgo TPU, on-device integer arithmetic on the seq_lens index
+    # tensor is unreliable: ``seq_lens - 1`` / ``clamp`` silently yields wrong
+    # values (observed: decode position 0 for a length-6 sequence, which makes
+    # RoPE apply the identity rotation and corrupts every decode step). This is
+    # the same on-device int-op hazard that forces ``compute_position_torch`` to
+    # do its range math on the host. So pull the lengths to host, compute the
+    # positions there, and move the int32 result back (int32 avoids the on-device
+    # int64 upcast that corrupts tensor metadata; RoPE index_select accepts it).
+    lens = seq_lens.tolist()
+    positions = [max(length - 1, 0) for length in lens]
+    return torch.tensor(positions, dtype=torch.int32).to(seq_lens.device)
+
+
 if is_cuda() or is_hip():
     from sglang.kernels.ops.attention.clamp_position import clamp_position_cuda
 
     clamp_position = clamp_position_cuda
+elif is_tpu():
+    clamp_position = _clamp_position_tpu
 else:
     clamp_position = _clamp_position_native
 

@@ -1,8 +1,23 @@
-"""TPU (Sophgo SG2260E) device operations for the SRT platform layer."""
+"""TPU (Sophgo SG2260E) device operations for the SRT platform layer.
+
+Unlike the earlier scaffold that treated TPU as a CPU-backed device, this
+platform drives the *real* ``"tpu"`` torch device provided by ``torch_tpu``
+(https://github.com/sophgo/torch-tpu). ``torch_tpu`` registers a privateuseone
+backend renamed to ``"tpu"`` and mirrors ``torch.cuda`` as ``torch.tpu``, so
+device management, memory queries and tensor placement all go through
+``torch.tpu`` / ``torch.get_device_module("tpu")``.
+
+Device numerical constraints (empirically verified on hardware) shape the
+serving defaults and the dedicated ``"tpu"`` attention backend:
+
+- matmul is correct only in bf16 (fp32/fp16 return garbage) → force bfloat16;
+- batched matmul (3D/4D bmm) is broken → the attention backend loops per head
+  over contiguous 2D matmuls;
+- ``F.scaled_dot_product_attention`` is unimplemented → custom attention math.
+"""
 
 from __future__ import annotations
 
-import ctypes
 import logging
 import os
 from typing import Optional
@@ -18,59 +33,131 @@ from sglang.srt.platforms.interface import SRTPlatform
 
 logger = logging.getLogger(__name__)
 
-# Sophgo TPU HBM size (32 GB for SG2260E, configurable via env)
-_TPU_HBM_SIZE = int(os.environ.get("SGLANG_TPU_HBM_SIZE", str(32 * 1024**3)))
-_TPU_DEVICE_ID = int(os.environ.get("SGLANG_TPU_DEVICE_ID", "2"))
+
+def _import_torch_tpu() -> None:
+    """Import torch_tpu, which registers the ``"tpu"`` device and ``torch.tpu``.
+
+    Idempotent: torch_tpu guards its own re-import, and ``torch.tpu`` simply
+    stays present once registered.
+    """
+    import torch_tpu  # noqa: F401
 
 
-def _get_tpu_runtime_lib():
-    """Attempt to load the TPU runtime library for memory queries."""
-    ppl_runtime_path = os.environ.get("PPL_RUNTIME_PATH", "")
-    lib_path = os.path.join(ppl_runtime_path, "libtpurt.so")
-    if os.path.exists(lib_path):
-        try:
-            return ctypes.CDLL(lib_path)
-        except OSError:
-            pass
-    return None
+_arange_shim_installed = False
+
+
+def _install_tpu_arange_shim() -> None:
+    """Make ``torch.arange(..., device="tpu")`` tolerate int64.
+
+    The device rejects ``torch.arange`` with an int64 dtype ("arange only
+    support int32 & float32 now"), yet SGLang creates index tensors (KV-cache
+    free lists, ``req_to_token``, page offsets, ...) with the int64 default all
+    over the hot path. A host→device copy of an int64 tensor is accepted (it is
+    materialized as int32, which is what indexing uses anyway), so for TPU
+    targets we build the range on CPU and copy it over. Non-TPU devices are
+    untouched. Idempotent.
+    """
+    global _arange_shim_installed
+    if _arange_shim_installed:
+        return
+
+    _orig_arange = torch.arange
+
+    def _arange(*args, **kwargs):
+        device = kwargs.get("device")
+        if device is not None and "tpu" in str(device):
+            # tpu scalar tensors as arange bounds are unsupported; coerce any
+            # 0-dim tensor start/stop/step to Python numbers first.
+            args = tuple(
+                a.item() if isinstance(a, torch.Tensor) else a for a in args
+            )
+            dtype = kwargs.get("dtype")
+            if dtype is None or dtype == torch.int64:
+                host_kwargs = dict(kwargs)
+                host_kwargs.pop("device", None)
+                return _orig_arange(*args, **host_kwargs).to(device)
+            return _orig_arange(*args, **kwargs)
+        return _orig_arange(*args, **kwargs)
+
+    torch.arange = _arange
+    _arange_shim_installed = True
+
+
+_blocking_copy_shim_installed = False
+
+
+def _install_tpu_blocking_copy_shim() -> None:
+    """Force ``non_blocking=True`` host<->device copies to be synchronous.
+
+    ``torch_tpu``'s async H2D copy reads the *source* CPU tensor after the
+    Python statement returns. SGLang's hot path is full of
+    ``torch.tensor(list).to(device, non_blocking=True)`` — the temporary CPU
+    tensor is freed before the async copy lands, so the device tensor ends up
+    holding garbage (verified: repeated ``[0, 6]`` copies yield ``[505560067,
+    0]``). ``non_blocking=False`` is always semantically correct (it only gives
+    up copy/compute overlap), so we strip the flag for every ``.to`` / ``.copy_``
+    once torch_tpu is active. Idempotent.
+    """
+    global _blocking_copy_shim_installed
+    if _blocking_copy_shim_installed:
+        return
+
+    _orig_to = torch.Tensor.to
+    _orig_copy_ = torch.Tensor.copy_
+
+    def _to(self, *args, **kwargs):
+        if kwargs.get("non_blocking"):
+            kwargs = dict(kwargs)
+            kwargs["non_blocking"] = False
+        return _orig_to(self, *args, **kwargs)
+
+    def _copy_(self, src, non_blocking=False):
+        return _orig_copy_(self, src, non_blocking=False)
+
+    torch.Tensor.to = _to
+    torch.Tensor.copy_ = _copy_
+    _blocking_copy_shim_installed = True
 
 
 class TpuDeviceMixin(DeviceMixin):
     """Sophgo TPU implementation of the shared device operations.
 
-    The Sophgo SG2260E TPU is accessed via the PPL toolchain and ctypes
-    bindings to libtpurt.so / libtpudnn.so. Tensors live on the host (CPU)
-    and are transferred to/from TPU HBM for kernel execution.
-
-    Since torch does not have a native "tpu" device backend for Sophgo chips,
-    we use "cpu" as the torch device type and manage TPU memory explicitly
-    via the PPL runtime.
+    All operations are delegated to ``torch.tpu`` (== ``torch.get_device_module
+    ("tpu")``), the CUDA-mirroring module that ``torch_tpu`` installs.
     """
 
     _enum: PlatformEnum = PlatformEnum.TPU
     device_name: str = "tpu"
-    device_type: str = "cpu"  # torch tensors live on CPU; TPU memory managed via PPL
+    device_type: str = "tpu"
+
+    @staticmethod
+    def _module():
+        # torch.tpu exists once torch_tpu has been imported (init_backend /
+        # activate guarantee this before any device op runs).
+        return torch.get_device_module("tpu")
 
     def get_device_total_memory(self, device_id: int = 0) -> int:
-        return _TPU_HBM_SIZE
+        _, total = self._module().mem_get_info(device_id)
+        return total
 
     def get_current_memory_usage(
         self, device: Optional[torch.device] = None
     ) -> float:
-        # No torch-level tracking for TPU; return 0 for now.
-        # Future: query PPL runtime for allocated TPU memory.
-        return 0.0
+        mod = self._module()
+        device_id = device.index if isinstance(device, torch.device) else device
+        mod.reset_peak_memory_stats(device_id)
+        return mod.max_memory_allocated(device_id)
 
-    def get_device(self, local_rank: int) -> torch.device:
-        # Sophgo TPU tensors are managed on CPU; actual TPU execution
-        # happens via explicit DMA in the PPL runtime.
-        return torch.device("cpu")
+    def get_device(self, device_id: Optional[int] = None) -> str:
+        if device_id is None:
+            return "tpu"
+        return f"tpu:{device_id}"
 
     def set_device(self, device: torch.device) -> None:
-        pass  # No-op: TPU device selection is via PPL's devid parameter
+        self._module().set_device(device)
 
     def get_device_name(self, device_id: int = 0) -> str:
-        return f"sophgo-sg2260e (devid={_TPU_DEVICE_ID})"
+        return self._module().get_device_name(device_id)
 
     def get_device_uuid(self, device_id: int = 0) -> str:
         return f"sophgo-tpu-{device_id}"
@@ -79,40 +166,31 @@ class TpuDeviceMixin(DeviceMixin):
         return None
 
     def empty_cache(self) -> None:
-        pass  # TPU memory managed by PPL runtime
+        self._module().empty_cache()
 
     def synchronize(self) -> None:
-        pass  # PPL kernel launches are synchronous
+        self._module().synchronize()
 
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
-        # Conservative: report full HBM as available (PPL manages internally)
-        return (_TPU_HBM_SIZE, _TPU_HBM_SIZE)
+        free, total = self._module().mem_get_info(device_id)
+        return (free, total)
 
     def is_pin_memory_available(self, device=None) -> bool:
         return False
 
-    def get_torch_distributed_backend_str(self) -> str:
-        return "gloo"
-
 
 class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
-    """Sophgo TPU SRT platform.
+    """Sophgo TPU SRT platform (real ``"tpu"`` torch device via torch_tpu).
 
-    Phase 1 implementation:
-    - Uses torch_native attention backend (SDPA on CPU tensors)
-    - No CUDA graph support
-    - No FP8 support
-    - Standard MHA KV pool (CPU-backed)
-    - Gloo for distributed communication
-
-    Future phases will add:
-    - PPL-accelerated attention kernels
-    - TPU HBM-backed KV cache pools
-    - Tensor parallelism via TPU interconnect
+    - bf16-only compute; a dedicated per-head 2D-matmul ``"tpu"`` attention
+      backend (no SDPA, no bmm);
+    - no CUDA graph / piecewise graph, no fp8;
+    - standard paged MHA KV pool allocated on the ``"tpu"`` device;
+    - gloo for host-side collectives (single-device TP=1 is the default).
     """
 
     def get_default_attention_backend(self) -> str:
-        return "torch_native"
+        return "tpu"
 
     def get_graph_runner_cls(self) -> type:
         raise NotImplementedError("TPU does not support graph capture/replay")
@@ -142,23 +220,65 @@ class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
         return False
 
     def apply_server_args_defaults(self, server_args) -> None:
-        """Apply TPU-specific defaults."""
-        # Disable chunked prefill by default (no async overlap on TPU)
-        if server_args.chunked_prefill_size is None:
-            server_args.chunked_prefill_size = -1
-        # Disable CUDA graph (not supported)
+        """Force the TPU-safe serving configuration.
+
+        The device only produces correct results in bf16 with the dedicated
+        ``"tpu"`` attention backend and pytorch sampling; graph capture and the
+        async overlap scheduler are not supported.
+        """
+        # bf16 is the only numerically-correct matmul dtype on this device.
+        if server_args.dtype in (None, "auto"):
+            server_args.dtype = "bfloat16"
+
+        # Route all attention through the TPU per-head 2D-matmul backend.
+        if server_args.attention_backend is None:
+            server_args.attention_backend = "tpu"
+        if server_args.prefill_attention_backend is None:
+            server_args.prefill_attention_backend = "tpu"
+        if server_args.decode_attention_backend is None:
+            server_args.decode_attention_backend = "tpu"
+
+        # Pure-pytorch sampling (no sgl-kernel / flashinfer sampling on TPU).
+        server_args.sampling_backend = "pytorch"
+
+        # No graph capture, no async overlap, no custom all-reduce on TPU. The
+        # cuda_graph_config was already resolved (before this hook runs) from the
+        # then-default disable_cuda_graph=False, so disable both phases directly
+        # on the config as well — mirroring the XPU/NPU handlers.
+        from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+
         server_args.disable_cuda_graph = True
+        server_args.cuda_graph_config.prefill.backend = Backend.DISABLED
+        server_args.cuda_graph_config.decode.backend = Backend.DISABLED
+        server_args.disable_overlap_schedule = True
+        server_args.enable_custom_all_reduce = False
+
+        # The eager runner otherwise copies each live batch into fixed static
+        # input buffers via ``torch._foreach_copy_`` (a leftover from graph
+        # capture, which TPU never does). That copy is pure overhead here and
+        # trips the device's stricter ``_foreach_copy_`` (which rejects a
+        # dst/src byte-size mismatch that arises from int64 index tensors being
+        # materialized as int32). Feed live tensors straight through instead.
+        # Respect an explicit user setting; only seed the default. The
+        # scheduler subprocess inherits this via os.environ.
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_EAGER_INPUT_NO_COPY.is_set():
+            envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
 
     def init_backend(self) -> None:
-        """Initialize PPL runtime if available."""
-        ppl_root = os.environ.get("PPL_PROJECT_ROOT")
-        if ppl_root:
-            logger.info("TPU backend: PPL_PROJECT_ROOT=%s", ppl_root)
-        else:
-            logger.warning(
-                "TPU backend: PPL_PROJECT_ROOT not set. "
-                "Hardware execution will not be available."
-            )
+        """Import torch_tpu (registers ``torch.tpu``) and select the device."""
+        _import_torch_tpu()
+        _install_tpu_arange_shim()
+        _install_tpu_blocking_copy_shim()
+        device_id = int(os.environ.get("SGLANG_TPU_DEVICE_ID", "0"))
+        torch.get_device_module("tpu").set_device(device_id)
+        logger.info(
+            "TPU backend initialized: %s (device %d of %d)",
+            self.get_device_name(device_id),
+            device_id,
+            torch.get_device_module("tpu").device_count(),
+        )
 
     def get_dispatch_key_name(self) -> str:
         return "native"
@@ -167,16 +287,27 @@ class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
 def activate():
     """Entry point for platform plugin discovery.
 
-    Returns the fully-qualified class name if TPU hardware is detected,
-    or None otherwise.
+    Returns the fully-qualified platform class name when TPU is requested
+    (``SGLANG_USE_TPU=1`` or a PPL project root is present) and torch_tpu can
+    be imported; otherwise ``None``.
     """
-    # Check if user explicitly requests TPU via environment
-    if os.environ.get("SGLANG_USE_TPU", "0") == "1":
-        return "sglang.srt.platforms.tpu.TpuSRTPlatform"
+    requested = os.environ.get("SGLANG_USE_TPU", "0") == "1" or bool(
+        os.environ.get("PPL_PROJECT_ROOT")
+    )
+    if not requested:
+        return None
 
-    # Auto-detect: check if PPL runtime is available
-    ppl_root = os.environ.get("PPL_PROJECT_ROOT")
-    if ppl_root and os.path.isdir(ppl_root):
-        return "sglang.srt.platforms.tpu.TpuSRTPlatform"
+    try:
+        _import_torch_tpu()
+    except ImportError:
+        logger.warning(
+            "SGLANG_USE_TPU requested but 'torch_tpu' could not be imported; "
+            "TPU platform not activated."
+        )
+        return None
 
-    return None
+    if not torch.get_device_module("tpu").is_available():
+        logger.warning("torch_tpu imported but no TPU device is available.")
+        return None
+
+    return "sglang.srt.platforms.tpu.TpuSRTPlatform"

@@ -187,6 +187,19 @@ def is_npu() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_tpu() -> bool:
+    if not hasattr(torch, "tpu"):
+        return False
+
+    if not torch.tpu.is_available():
+        raise RuntimeError(
+            "torch_tpu detected, but TPU device is not available or visible."
+        )
+
+    return True
+
+
+@lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
@@ -498,6 +511,20 @@ def get_available_gpu_memory(
                 free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
         else:
             free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
+    elif device == "tpu":
+        num_gpus = torch.tpu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.tpu.current_device() != gpu_id:
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch TPU context.",
+                gpu_id,
+                torch.tpu.current_device(),
+            )
+        if empty_cache:
+            empty_device_cache(torch.tpu)
+        free_gpu_memory, total_gpu_memory = torch.tpu.mem_get_info(gpu_id)
     elif device == "musa":
         num_gpus = torch.musa.device_count()
         assert gpu_id < num_gpus
@@ -831,6 +858,11 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_xpu_memory_capacity()
     elif device == "musa":
         gpu_mem = get_mtgpu_memory_capacity()
+    elif device == "tpu":
+        # torch.tpu.get_device_properties reports 0 for total_memory; use the
+        # runtime's mem_get_info (free, total) instead.
+        _, total_bytes = torch.tpu.mem_get_info()
+        gpu_mem = total_bytes / (1 << 20)  # bytes -> MiB
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -850,6 +882,9 @@ def get_device_name(device_id: int = 0) -> str:
 
     if hasattr(torch, "npu") and torch.npu.is_available():
         return torch.npu.get_device_name(device_id)
+
+    if hasattr(torch, "tpu") and torch.tpu.is_available():
+        return torch.tpu.get_device_name(device_id)
 
 
 @lru_cache(maxsize=1)
@@ -1301,7 +1336,7 @@ def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "tpu"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
