@@ -441,6 +441,10 @@ class Envs:
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
+    # Trace every aten op dispatched to the TPU device (op type + input/output
+    # tensor shapes), via a TorchDispatchMode installed in the TPU platform's
+    # init_backend. Debug-only and very verbose. See hardware_backend/tpu/trace.py.
+    SGLANG_DEBUG_TPU_TRACE = EnvBool(False)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)

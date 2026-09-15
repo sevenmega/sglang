@@ -273,6 +273,12 @@ class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
         _install_tpu_blocking_copy_shim()
         device_id = int(os.environ.get("SGLANG_TPU_DEVICE_ID", "0"))
         torch.get_device_module("tpu").set_device(device_id)
+
+        # Optional op-level trace (SGLANG_DEBUG_TPU_TRACE=1): log every aten op
+        # dispatched to the device with its input/output shapes.
+        from sglang.srt.hardware_backend.tpu.trace import maybe_enable_tpu_op_trace
+
+        maybe_enable_tpu_op_trace()
         logger.info(
             "TPU backend initialized: %s (device %d of %d)",
             self.get_device_name(device_id),
