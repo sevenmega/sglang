@@ -11,9 +11,12 @@ we register a TPU-safe per-head 2D-matmul attention (mirroring the real
 ops on the device.
 
 Env: LAYER (default 0), REF_OUT (default /tmp/layer_ref.pt), device via
-SGLANG_TPU_DEVICE_ID (default 4). Run under /tmp/tpu_env.sh.
+SGLANG_TPU_DEVICE_ID (default 4). Run under tpu_env.sh. Set
+SGLANG_DEBUG_TPU_TRACE=1 to print a ``[TPU-OP]`` line per aten op in this
+layer's forward (op type + input/output shapes) for debugging/optimization.
 """
 
+import contextlib
 import os
 
 import torch
@@ -91,7 +94,17 @@ position_ids = _to_dev(ref["position_ids"])
 pe = ref["position_embeddings"]
 position_embeddings = (_to_dev(pe[0]), _to_dev(pe[1])) if pe is not None else None
 
-with torch.no_grad():
+# Optional op-level trace of *this single layer's* forward
+# (SGLANG_DEBUG_TPU_TRACE=1). This script drives the layer directly and never
+# calls the SGLang TPU platform's init_backend(), which is where serving runs
+# install the tracer -- so we install it here ourselves, and scope it to just
+# the forward() so the trace is the layer's compute ops (no weight-copy noise).
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.trace import TpuOpTracer
+
+trace_cm = TpuOpTracer() if envs.SGLANG_DEBUG_TPU_TRACE.get() else contextlib.nullcontext()
+
+with torch.no_grad(), trace_cm:
     out = layer(
         hidden_states,
         attention_mask=attention_mask,
