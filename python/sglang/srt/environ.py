@@ -445,6 +445,10 @@ class Envs:
     # tensor shapes), via a TorchDispatchMode installed in the TPU platform's
     # init_backend. Debug-only and very verbose. See hardware_backend/tpu/trace.py.
     SGLANG_DEBUG_TPU_TRACE = EnvBool(False)
+    # Use the tilelang PPL online-softmax flash-attention kernel for the TPU
+    # attention backend instead of the per-head 2D-matmul loop. On any error
+    # (kernel build/launch) the backend falls back to the torch loop.
+    SGLANG_TPU_USE_FLASH_ATTN = EnvBool(True)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
