@@ -449,6 +449,11 @@ class Envs:
     # attention backend instead of the per-head 2D-matmul loop. On any error
     # (kernel build/launch) the backend falls back to the torch loop.
     SGLANG_TPU_USE_FLASH_ATTN = EnvBool(True)
+    # The TPU device this process opens on. This is the authoritative selector:
+    # the TPU platform reconciles base_gpu_id against it during ServerArgs
+    # construction (see TpuSRTPlatform.apply_server_args_defaults), so setting
+    # this alone is enough to pin every entry point to one chip.
+    SGLANG_TPU_DEVICE_ID = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)

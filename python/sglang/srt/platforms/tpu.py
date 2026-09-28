@@ -266,12 +266,39 @@ class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
         if not envs.SGLANG_EAGER_INPUT_NO_COPY.is_set():
             envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
 
+        # Single source of truth for the device. Two independent selectors reach
+        # the chip: init_backend() opens the device named by SGLANG_TPU_DEVICE_ID,
+        # while ModelRunner re-selects from server_args.base_gpu_id. If they
+        # disagree, torch's current device desyncs from the PPL runtime and the
+        # first device touch (the mem_get_info probe in
+        # bootstrap.init_torch_distributed) blocks without ever reaching the
+        # hardware. Reconcile here — before either is read — so a single knob
+        # pins every entry point (Engine, offline_throughput, one_batch) to one
+        # chip. The scheduler subprocess inherits the env var via os.environ.
+        if envs.SGLANG_TPU_DEVICE_ID.is_set():
+            device_id = envs.SGLANG_TPU_DEVICE_ID.get()
+            if server_args.base_gpu_id != device_id:
+                logger.warning(
+                    "base_gpu_id=%d does not match SGLANG_TPU_DEVICE_ID=%d; "
+                    "using %d for both (they must select the same TPU chip).",
+                    server_args.base_gpu_id,
+                    device_id,
+                    device_id,
+                )
+                server_args.base_gpu_id = device_id
+        else:
+            envs.SGLANG_TPU_DEVICE_ID.set(server_args.base_gpu_id)
+
     def init_backend(self) -> None:
         """Import torch_tpu (registers ``torch.tpu``) and select the device."""
         _import_torch_tpu()
         _install_tpu_arange_shim()
         _install_tpu_blocking_copy_shim()
-        device_id = int(os.environ.get("SGLANG_TPU_DEVICE_ID", "0"))
+        # apply_server_args_defaults has already reconciled this with
+        # base_gpu_id, so reading it here stays in lockstep with ModelRunner.
+        from sglang.srt.environ import envs
+
+        device_id = envs.SGLANG_TPU_DEVICE_ID.get()
         torch.get_device_module("tpu").set_device(device_id)
 
         # Optional op-level trace (SGLANG_DEBUG_TPU_TRACE=1): log every aten op

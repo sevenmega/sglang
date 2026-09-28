@@ -1015,7 +1015,11 @@ def main(server_args, bench_args):
     local_rank_end = local_rank_start + nranks_per_node
 
     if server_args.tp_size == 1:
-        work_func(server_args, port_args, bench_args, 0, 0)
+        # Honor base_gpu_id for the single-device case instead of hardcoding 0.
+        # On TPU the platform selects the device from SGLANG_TPU_DEVICE_ID at
+        # init_backend() time; ModelRunner then re-selects via ps.gpu_id. The two
+        # must agree, so run on base_gpu_id (set it equal to SGLANG_TPU_DEVICE_ID).
+        work_func(server_args, port_args, bench_args, server_args.base_gpu_id, 0)
     else:
         workers = []
         for tp_rank in range(local_rank_start, local_rank_end):
