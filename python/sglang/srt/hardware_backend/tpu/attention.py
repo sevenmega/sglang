@@ -46,8 +46,9 @@ _MASK_NEG = -1e9
 # -1e9 overflows fp16 (max ~65504). Anything <= this is treated as masked.
 _FLASH_MASK_NEG = -30000.0
 
-# Module-cached flash kernels keyed by (Hq, Sq, Skv, D, Hkv). Building invokes
-# ppl-compile (seconds), so compile once per shape.
+# Module-cached flash kernels keyed by (D, scaling). The kernel is shape-generic
+# (dynamic B/Hq/Sq/Hkv/Skv), so one build per (head-dim, scale) serves every
+# request; building invokes ppl-compile (seconds), so it runs at most once.
 _FLASH_KERNELS: dict[tuple, object] = {}
 # Set once we discover the flash kernel is unavailable (import/build failure) so
 # we don't retry ppl-compile on every request.
@@ -106,19 +107,22 @@ def _sync_rt_device() -> None:
 def _get_flash_kernel(
     *, hq: int, sq: int, skv: int, d: int, hkv: int, scaling: float
 ):
-    """Return a cached tilelang flash kernel for this shape, or None if the
-    tilelang TPU backend is unavailable.
+    """Return a cached tilelang flash kernel, or None if tilelang is unavailable.
 
-    ``sq``/``skv`` must already be padded to the kernel's tile sizes (see
-    :meth:`TpuAttnBackend._attend_flash`); the DSL kernel does not clamp
-    partial tiles, so every tile it loads must be fully in range.  ``scaling``
-    is traced in as ``sm_scale`` (baked into the TIR), so it is part of the
-    cache key.
+    The DSL kernel is **shape-generic**: ``B/Hq/Sq/Hkv/Skv`` are dynamic, so a
+    single build serves every request. Only ``d`` (head dim, which sizes the
+    on-chip tiles) and ``scaling`` (baked as ``sm_scale``) are compile-time, so
+    the cache key is just ``(d, scaling)`` — ``hq``/``sq``/``skv``/``hkv`` are
+    accepted for call-site symmetry but do not trigger a rebuild.
+
+    ``sq``/``skv`` must still be padded to the kernel's tile sizes (see
+    :meth:`TpuAttnBackend._attend_flash`); the DSL kernel does not clamp partial
+    tiles, so every tile it loads must be fully in range.
     """
     global _FLASH_DISABLED
     if _FLASH_DISABLED:
         return None
-    key = (hq, sq, skv, d, hkv, float(scaling))
+    key = (d, float(scaling))
     kern = _FLASH_KERNELS.get(key)
     if kern is None:
         try:
@@ -128,9 +132,9 @@ def _get_flash_kernel(
                 sys.path.insert(0, "/workspace/tilelang")
             from tilelang.tpu.kernels.attention import flash_attention_gqa
 
-            kern = flash_attention_gqa.compile(
-                B=1, Sq=sq, Skv=skv, Hq=hq, Hkv=hkv, D=d, sm_scale=float(scaling)
-            )
+            # Lazy factory call (dynamic-shape idiom): compiles one generic
+            # kernel; runtime dims are resolved per call from the input shapes.
+            kern = flash_attention_gqa(d=d, sm_scale=float(scaling))
             _FLASH_KERNELS[key] = kern
         except Exception as exc:  # noqa: BLE001
             logger.warning(

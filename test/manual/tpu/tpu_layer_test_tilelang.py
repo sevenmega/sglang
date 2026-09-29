@@ -58,15 +58,14 @@ def _causal_mask(b, sq, skv):
 
 
 def _get_flash_kernel(b, qm, kvm, d, q_head, kv_head, scaling):
-    key = (b, qm, kvm, d, q_head, kv_head, float(scaling))
+    # Shape-generic kernel: only (d, scaling) are compile-time, so key on those.
+    key = (d, float(scaling))
     kern = _FLASH_KERNELS.get(key)
     if kern is None:
         from tilelang.tpu.kernels.attention import flash_attention_gqa
 
-        kern = flash_attention_gqa.compile(
-            B=b, Sq=qm, Skv=kvm, Hq=q_head, Hkv=kv_head, D=d,
-            sm_scale=float(scaling),
-        )
+        # Lazy factory call (dynamic B/Hq/Sq/Hkv/Skv resolved per launch).
+        kern = flash_attention_gqa(d=d, sm_scale=float(scaling))
         _FLASH_KERNELS[key] = kern
     return kern
 
