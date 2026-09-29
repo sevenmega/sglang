@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.environ import envs
@@ -46,55 +47,116 @@ _MASK_NEG = -1e9
 # -1e9 overflows fp16 (max ~65504). Anything <= this is treated as masked.
 _FLASH_MASK_NEG = -30000.0
 
+# The tilelang kernel's fixed on-chip tiles: block_M query rows, block_N keys.
+# It does not clamp partial tiles, so every tile it loads must be fully in range
+# -- hence the padding to these multiples. Keep in sync with
+# ``tilelang.tpu.kernels.attention.flash_attention_gqa``.
+_FLASH_BLOCK_M = 8
+_FLASH_BLOCK_N = 128
+
+# Cap on how many requests one batched launch covers. The kernel itself is happy
+# with any B, but the driver materializes [B, H, S_pad, D] fp16 host buffers for
+# q/k/v, so a large bucket costs host memory (a 64-wide prefill bucket at
+# S_pad=256, H=16, D=128 is ~270 MB). Buckets larger than this are chunked.
+_FLASH_MAX_BATCH = 64
+
+
+def _flash_pad_lens(q_len: int, kv_len: int) -> tuple[int, int]:
+    """Pad (q_len, kv_len) up to the kernel's tile multiples.
+
+    ``kv_pad`` is additionally floored at ``q_pad`` because the mask builder
+    needs ``query_offset = kv_len - q_len`` to be non-negative.
+    """
+    q_pad = -(-q_len // _FLASH_BLOCK_M) * _FLASH_BLOCK_M
+    kv_pad = -(-kv_len // _FLASH_BLOCK_N) * _FLASH_BLOCK_N
+    return q_pad, max(q_pad, kv_pad)
+
+
+def _pack_flash_batch(items: list, *, n_heads: int, s_pad: int) -> torch.Tensor:
+    """Zero-pad a list of per-request ``[H, S_i, D]`` into ``[N, H, s_pad, D]`` fp16.
+
+    The dtype cast happens on the host: the device only supports same-dtype
+    copies, and the kernel marshals its arguments through CPU memory anyway.
+    """
+    d = items[0].shape[2]
+    packed = torch.zeros(len(items), n_heads, s_pad, d, dtype=torch.float16)
+    for i, x in enumerate(items):
+        packed[i, :, : x.shape[1]] = x.detach().cpu().half()
+    return packed
+
+
 # Module-cached flash kernels keyed by (D, scaling). The kernel is shape-generic
 # (dynamic B/Hq/Sq/Hkv/Skv), so one build per (head-dim, scale) serves every
 # request; building invokes ppl-compile (seconds), so it runs at most once.
 _FLASH_KERNELS: dict[tuple, object] = {}
 
 # --- TEMP instrumentation: flash-attention call shapes --------------------
-# Set SGLANG_TPU_LOG_FLASH_SHAPES=1 to print every call's real + padded shape and
-# a deduplicated union at process exit. Used to see which shapes a workload
-# actually exercises (prefill vs decode, per-request vs batched).
+# Set SGLANG_TPU_LOG_FLASH_SHAPES=1 to log every launch (shape + batch size) and,
+# at process exit, the deduplicated shape union plus the total launch count. The
+# launch count is the metric the batched path is judged on: 32 requests in one
+# forward should show up as one launch instead of 32.
 _FLASH_SHAPE_SET: set = set()
+_FLASH_LAUNCH_COUNT = 0
 _FLASH_SHAPE_LOG_ARMED = False
+
+
+def _flash_log_enabled() -> bool:
+    return envs.SGLANG_TPU_LOG_FLASH_SHAPES.get()
+
+
+def _flash_log_arm_dump() -> None:
+    """Register the exit-time dump once, lazily."""
+    global _FLASH_SHAPE_LOG_ARMED
+    if _FLASH_SHAPE_LOG_ARMED:
+        return
+    import atexit
+    import sys
+
+    def _dump() -> None:
+        rows = sorted(_FLASH_SHAPE_SET)
+        print(
+            f"\n[FLASH-SHAPE] === {len(rows)} distinct shapes, "
+            f"{_FLASH_LAUNCH_COUNT} launches ===",
+            file=sys.stderr,
+            flush=True,
+        )
+        for r in rows:
+            print(
+                f"[FLASH-SHAPE] hq={r[0]} hkv={r[1]} q_len={r[2]} kv_len={r[3]} "
+                f"q_pad={r[4]} kv_pad={r[5]} d={r[6]} scale={r[7]:.6g}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    atexit.register(_dump)
+    _FLASH_SHAPE_LOG_ARMED = True
 
 
 def _record_flash_shape(*, hq: int, hkv: int, q_len: int, kv_len: int,
                         q_pad: int, kv_pad: int, d: int, scaling: float) -> None:
-    global _FLASH_SHAPE_LOG_ARMED
-    import os
+    """Record one *request's* shape (deduplicated) for the exit-time table."""
+    if not _flash_log_enabled():
+        return
+    _FLASH_SHAPE_SET.add((hq, hkv, q_len, kv_len, q_pad, kv_pad, d, float(scaling)))
+    _flash_log_arm_dump()
+
+
+def _record_flash_launch(*, batch: int, q_pad: int, kv_pad: int, d: int,
+                         scaling: float) -> None:
+    """Count and log one *kernel launch*, with the number of requests it covered."""
+    global _FLASH_LAUNCH_COUNT
+    if not _flash_log_enabled():
+        return
     import sys
 
-    if os.environ.get("SGLANG_TPU_LOG_FLASH_SHAPES") != "1":
-        return
-    key = (hq, hkv, q_len, kv_len, q_pad, kv_pad, d, float(scaling))
-    _FLASH_SHAPE_SET.add(key)
+    _FLASH_LAUNCH_COUNT += 1
     print(
-        f"[FLASH-SHAPE] hq={hq} hkv={hkv} q_len={q_len} kv_len={kv_len} "
+        f"[FLASH-LAUNCH] #{_FLASH_LAUNCH_COUNT} batch={batch} "
         f"q_pad={q_pad} kv_pad={kv_pad} d={d} scale={float(scaling):.6g}",
         file=sys.stderr,
         flush=True,
     )
-    if not _FLASH_SHAPE_LOG_ARMED:
-        import atexit
-
-        def _dump() -> None:
-            rows = sorted(_FLASH_SHAPE_SET)
-            print(
-                f"\n[FLASH-SHAPE] === {len(rows)} distinct flash-attention shapes ===",
-                file=sys.stderr,
-                flush=True,
-            )
-            for r in rows:
-                print(
-                    f"[FLASH-SHAPE] hq={r[0]} hkv={r[1]} q_len={r[2]} kv_len={r[3]} "
-                    f"q_pad={r[4]} kv_pad={r[5]} d={r[6]} scale={r[7]:.6g}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-
-        atexit.register(_dump)
-        _FLASH_SHAPE_LOG_ARMED = True
+    _flash_log_arm_dump()
 # Set once we discover the flash kernel is unavailable (import/build failure) so
 # we don't retry ppl-compile on every request.
 _FLASH_DISABLED = False
@@ -147,6 +209,82 @@ def _sync_rt_device() -> None:
     if _TPURT_SET_DEVICE is False:
         return
     _TPURT_SET_DEVICE(_rt_device())
+
+
+class _AttnReqPlan(msgspec.Struct, frozen=True):
+    """Where one request's query and KV live in the paged buffers.
+
+    Resolved once, read-only, so the batching driver never re-derives offsets
+    while it is also scattering outputs.
+    """
+
+    q_start: int  # offset of this request's query rows in the packed query
+    q_len: int
+    kv_start: int  # absolute cache position of its first key
+    kv_len: int
+    req_pool_idx: int  # row of ``req_to_token`` holding its token indices
+
+
+def _plan_attention_requests(
+    *,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    q_lens: list[int],
+    encoder_lens: Optional[torch.Tensor],
+    is_cross_attn: bool,
+) -> list[_AttnReqPlan]:
+    """Resolve each request's query rows and KV extent.
+
+    ``q_lens`` is ``extend_seq_lens`` for extend and all-ones for decode. The KV
+    window is the request's encoder slice for cross-attention, the sequence
+    cached after the encoder prefix otherwise, and the plain sequence with no
+    encoder.
+    """
+    plans = []
+    q_start = 0
+    for seq_idx in range(len(q_lens)):
+        q_len = q_lens[seq_idx]
+        seq_len_kv = int(seq_lens[seq_idx])
+        if encoder_lens is not None:
+            if is_cross_attn:
+                kv_start = 0
+                kv_len = int(encoder_lens[seq_idx])
+            else:
+                kv_start = int(encoder_lens[seq_idx])
+                kv_len = seq_len_kv
+        else:
+            kv_start = 0
+            kv_len = seq_len_kv
+        plans.append(
+            _AttnReqPlan(
+                q_start=q_start,
+                q_len=q_len,
+                kv_start=kv_start,
+                kv_len=kv_len,
+                req_pool_idx=int(req_pool_indices[seq_idx]),
+            )
+        )
+        q_start += q_len
+    return plans
+
+
+def _bucket_attention_plans(
+    plans: list[_AttnReqPlan], *, n_q_heads: int, n_kv_heads: int
+) -> list[list[_AttnReqPlan]]:
+    """Group requests that can share one launch, preserving arrival order.
+
+    The bucket key is the *padded* shape the kernel will actually be launched
+    with -- padding to the on-chip tile sizes is what makes requests of
+    different lengths incompatible, so two requests are only combinable when
+    their padded shapes match exactly. Head counts are part of the key because a
+    single launch covers one (H_q, H_kv) pair.
+    """
+    buckets: dict[tuple, list[_AttnReqPlan]] = {}
+    for plan in plans:
+        q_pad, kv_pad = _flash_pad_lens(plan.q_len, plan.kv_len)
+        key = (q_pad, kv_pad, n_q_heads, n_kv_heads)
+        buckets.setdefault(key, []).append(plan)
+    return list(buckets.values())
 
 
 def _get_flash_kernel(
@@ -237,6 +375,49 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         return mask
 
     @staticmethod
+    def _build_batched_additive_mask(
+        *,
+        q_lens: list[int],
+        kv_lens: list[int],
+        q_pad: int,
+        kv_pad: int,
+        causal: bool,
+        sliding_window_size: Optional[int],
+    ) -> torch.Tensor:
+        """Assemble the block-diagonal ``[B, q_pad, kv_pad]`` additive mask.
+
+        Slice ``b`` is request ``b``'s own padded mask, so a query row can only
+        put softmax mass on its own request's keys. The per-request causal/window
+        arithmetic is delegated to :meth:`_build_additive_mask` -- this only pads
+        and stacks. Padded *key columns* stay at ``_FLASH_MASK_NEG``: their V rows
+        are meaningless zeros, so a real query must never attend them. Padded
+        *query rows* are filled with 0 instead, which is neutral either way (the
+        kernel's softmax max is reduced per query row -- ``reduce_max(acc_s,
+        m_cur, dim=1)`` -- so a padded row cannot perturb a real one) and keeps
+        the padded rows' arithmetic away from the masked-exponent path. Those
+        rows' outputs are sliced off regardless.
+        """
+        assert len(q_lens) == len(kv_lens)
+        masks = torch.full(
+            (len(q_lens), q_pad, kv_pad), _FLASH_MASK_NEG, dtype=torch.float32
+        )
+        for b, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens)):
+            per_req = TpuAttnBackend._build_additive_mask(
+                q_len=q_len,
+                kv_len=kv_len,
+                causal=causal,
+                sliding_window_size=sliding_window_size,
+            )
+            # ``None`` means "no constraint at all" (decode attending every
+            # cached key), i.e. an all-zero real block.
+            if per_req is not None:
+                masks[b, :q_len, :kv_len] = per_req.clamp_min(_FLASH_MASK_NEG)
+            else:
+                masks[b, :q_len, :kv_len] = 0.0
+            masks[b, q_len:, :] = 0.0
+        return masks
+
+    @staticmethod
     def _attend_flash(
         *,
         q: torch.Tensor,  # [H_q, S_q, D]
@@ -322,6 +503,9 @@ class TpuAttnBackend(TorchNativeAttnBackend):
             # current device from its stream. Re-assert it before launching.
             _sync_rt_device()
             res = kernel(q_b, k_b, v_b, mask)  # [1,Hq,q_pad,D] fp16
+            _record_flash_launch(
+                batch=1, q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling
+            )
             # [1,Hq,q_pad,D] -> [Hq,q_len,D]; cast + move on the host.
             resc = res[0, :, :q_len].contiguous()
             out.copy_(resc.to(out.dtype).to(out.device))
@@ -333,6 +517,66 @@ class TpuAttnBackend(TorchNativeAttnBackend):
                 exc,
             )
             return False
+
+    @staticmethod
+    def _attend_flash_batch(
+        *,
+        qs: list[torch.Tensor],  # per request: [H_q, S_q, D]
+        ks: list[torch.Tensor],  # per request: [H_kv, S_kv, D]
+        vs: list[torch.Tensor],  # per request: [H_kv, S_kv, D]
+        q_lens: list[int],
+        kv_lens: list[int],
+        q_pad: int,
+        kv_pad: int,
+        scaling: float,
+        causal: bool,
+        sliding_window_size: Optional[int],
+    ) -> Optional[torch.Tensor]:
+        """One flash-attention launch for a whole bucket of requests.
+
+        Returns the padded ``[B, H_q, q_pad, D]`` fp16 result, or None if the
+        launch failed. All-or-nothing: the caller falls back to the per-request
+        loop for the *whole* bucket, so no partially-batched result is ever mixed
+        into the output.
+        """
+        num_q_heads, _, d = qs[0].shape
+        num_kv_heads = ks[0].shape[0]
+        kernel = _get_flash_kernel(
+            hq=num_q_heads,
+            sq=q_pad,
+            skv=kv_pad,
+            d=d,
+            hkv=num_kv_heads,
+            scaling=scaling,
+        )
+        if kernel is None:
+            return None
+        try:
+            q_b = _pack_flash_batch(qs, n_heads=num_q_heads, s_pad=q_pad)
+            k_b = _pack_flash_batch(ks, n_heads=num_kv_heads, s_pad=kv_pad)
+            v_b = _pack_flash_batch(vs, n_heads=num_kv_heads, s_pad=kv_pad)
+            mask = TpuAttnBackend._build_batched_additive_mask(
+                q_lens=q_lens,
+                kv_lens=kv_lens,
+                q_pad=q_pad,
+                kv_pad=kv_pad,
+                causal=causal,
+                sliding_window_size=sliding_window_size,
+            ).contiguous()  # [B, q_pad, kv_pad]
+            _sync_rt_device()
+            out = kernel(q_b, k_b, v_b, mask)  # [B, H_q, q_pad, D] fp16
+            _record_flash_launch(
+                batch=len(qs), q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling
+            )
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[TPU] batched flash-attention launch failed (%s); "
+                "falling back to the per-request loop for all %d requests.",
+                exc,
+                len(qs),
+            )
+            return None
 
     def _attend_per_req(
         self,
@@ -380,6 +624,236 @@ class TpuAttnBackend(TorchNativeAttnBackend):
     # ------------------------------------------------------------------
     # Overrides of the SDPA extend/decode drivers
     # ------------------------------------------------------------------
+    #
+    # The base class loops one request at a time and launches attention once
+    # per iteration. Here the loop is *planned* first -- every request's query
+    # rows and KV extent resolved read-only into _AttnReqPlan -- then requests
+    # sharing a padded shape are handed to the flash kernel in one launch. Any
+    # request that cannot be grouped, or whose bucket fails to launch, runs the
+    # original per-request path unchanged, so batching only ever removes
+    # launches; it never changes which math a request gets.
+
+    @staticmethod
+    def _use_batched_flash(*, is_cross_attn: bool) -> bool:
+        """Batched launches need an additive mask, not an implicit causal one.
+
+        Cross-attention is left on the per-request path: it is rare here and its
+        KV extent comes from the encoder, so batching it buys little.
+        """
+        if is_cross_attn:
+            return False
+        return (
+            envs.SGLANG_TPU_USE_FLASH_ATTN.get()
+            and envs.SGLANG_TPU_USE_BATCHED_FLASH_ATTN.get()
+        )
+
+    def _gather_plan_qkv(
+        self,
+        *,
+        plan: _AttnReqPlan,
+        query: torch.Tensor,  # [H_q, num_tokens, D]
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Slice one request's q/k/v out of the packed query and paged KV cache."""
+        q_i = query[:, plan.q_start : plan.q_start + plan.q_len, :]
+        tokens = req_to_token[
+            plan.req_pool_idx, plan.kv_start : plan.kv_start + plan.kv_len
+        ]
+        k_i = k_cache[tokens].movedim(0, 1)  # [H_kv, S_kv, D]
+        v_i = v_cache[tokens].movedim(0, 1)
+        if not (q_i.dtype == k_i.dtype == v_i.dtype):
+            k_i = k_i.to(q_i.dtype)
+            v_i = v_i.to(q_i.dtype)
+        return q_i, k_i, v_i
+
+    @staticmethod
+    def _scatter_plan_output(
+        *,
+        output: torch.Tensor,  # [num_tokens, H_q, D]
+        plan: _AttnReqPlan,
+        per_req_out: torch.Tensor,  # [H_q, S_q, D]
+    ) -> None:
+        """Write one request's [H_q, S_q, D] result back into [T, H_q, D] layout."""
+        output[plan.q_start : plan.q_start + plan.q_len, :, :] = per_req_out.movedim(
+            1, 0
+        )
+
+    def _attend_plan_serial(
+        self,
+        *,
+        plan: _AttnReqPlan,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+        scaling: float,
+        causal: bool,
+        sliding_window_size: Optional[int],
+    ) -> None:
+        """The fallback: one request, one launch, exactly the pre-batching path."""
+        q_i, k_i, v_i = self._gather_plan_qkv(
+            plan=plan,
+            query=query,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            req_to_token=req_to_token,
+        )
+        per_req_out = torch.empty_like(q_i)
+        self._attend_per_req(
+            q=q_i,
+            k=k_i,
+            v=v_i,
+            out=per_req_out,
+            scaling=scaling,
+            causal=causal,
+            sliding_window_size=sliding_window_size,
+        )
+        self._scatter_plan_output(output=output, plan=plan, per_req_out=per_req_out)
+
+    def _attend_plan_bucket(
+        self,
+        *,
+        plans: list[_AttnReqPlan],
+        query: torch.Tensor,
+        output: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+        scaling: float,
+        causal: bool,
+        sliding_window_size: Optional[int],
+    ) -> bool:
+        """One launch for every request in ``plans`` (same padded shape).
+
+        Returns False if the launch failed, leaving ``output`` untouched so the
+        caller can redo the whole bucket on the per-request path.
+        """
+        q_lens = [p.q_len for p in plans]
+        kv_lens = [p.kv_len for p in plans]
+        # Every plan here shares a padded shape by construction (the bucket key),
+        # so one request's padding describes the whole launch.
+        q_pad, kv_pad = _flash_pad_lens(q_lens[0], kv_lens[0])
+        d = query.shape[-1]
+        for plan in plans:
+            _record_flash_shape(
+                hq=query.shape[0], hkv=k_cache.shape[1],
+                q_len=plan.q_len, kv_len=plan.kv_len,
+                q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling,
+            )
+
+        qs, ks, vs = [], [], []
+        for plan in plans:
+            q_i, k_i, v_i = self._gather_plan_qkv(
+                plan=plan,
+                query=query,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                req_to_token=req_to_token,
+            )
+            qs.append(q_i)
+            ks.append(k_i)
+            vs.append(v_i)
+
+        out = self._attend_flash_batch(
+            qs=qs,
+            ks=ks,
+            vs=vs,
+            q_lens=q_lens,
+            kv_lens=kv_lens,
+            q_pad=q_pad,
+            kv_pad=kv_pad,
+            scaling=scaling,
+            causal=causal,
+            sliding_window_size=sliding_window_size,
+        )
+        if out is None:
+            return False
+
+        for b, plan in enumerate(plans):
+            # [H_q, q_pad, D] -> this request's [H_q, q_len, D], cast/moved on
+            # the host (out came back from the kernel in host fp16).
+            seg = out[b, :, : plan.q_len, :]
+            self._scatter_plan_output(
+                output=output,
+                plan=plan,
+                per_req_out=seg.to(output.dtype).to(output.device),
+            )
+        return True
+
+    def _run_sdpa_batched_attention(
+        self,
+        *,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        q_lens: list[int],
+        encoder_lens: Optional[torch.Tensor],
+        scaling: float,
+        causal: bool,
+        is_cross_attn: bool,
+        sliding_window_size: Optional[int],
+    ) -> torch.Tensor:
+        """Shared extend/decode core: plan, bucket, launch, scatter, fall back."""
+        # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
+        query = query.movedim(0, query.dim() - 2)
+
+        plans = _plan_attention_requests(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            q_lens=q_lens,
+            encoder_lens=encoder_lens,
+            is_cross_attn=is_cross_attn,
+        )
+
+        def run_serial(plan_list):
+            for plan in plan_list:
+                self._attend_plan_serial(
+                    plan=plan,
+                    query=query,
+                    output=output,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    req_to_token=req_to_token,
+                    scaling=scaling,
+                    causal=causal,
+                    sliding_window_size=sliding_window_size,
+                )
+
+        if not self._use_batched_flash(is_cross_attn=is_cross_attn):
+            run_serial(plans)
+            return output
+
+        buckets = _bucket_attention_plans(
+            plans, n_q_heads=query.shape[0], n_kv_heads=k_cache.shape[1]
+        )
+        for bucket in buckets:
+            for start in range(0, len(bucket), _FLASH_MAX_BATCH):
+                chunk = bucket[start : start + _FLASH_MAX_BATCH]
+                # A lone request has nothing to batch -- skip straight to the
+                # path that already handles every shape.
+                if len(chunk) == 1:
+                    run_serial(chunk)
+                    continue
+                if not self._attend_plan_bucket(
+                    plans=chunk,
+                    query=query,
+                    output=output,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    req_to_token=req_to_token,
+                    scaling=scaling,
+                    causal=causal,
+                    sliding_window_size=sliding_window_size,
+                ):
+                    run_serial(chunk)
+        return output
 
     def _run_sdpa_forward_extend(
         self,
@@ -402,49 +876,21 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
         assert seq_lens.shape[0] == extend_seq_lens.shape[0]
 
-        # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
-        query = query.movedim(0, query.dim() - 2)
-
-        start_q, start_kv = 0, 0
-        for seq_idx in range(seq_lens.shape[0]):
-            extend_seq_len_q = int(extend_seq_lens[seq_idx])
-            seq_len_kv = int(seq_lens[seq_idx])
-            end_q = start_q + extend_seq_len_q
-            if encoder_lens is not None:
-                if is_cross_attn:
-                    start_kv = 0
-                    end_kv = int(encoder_lens[seq_idx])
-                else:
-                    start_kv = int(encoder_lens[seq_idx])
-                    end_kv = start_kv + seq_len_kv
-            else:
-                start_kv = 0
-                end_kv = start_kv + seq_len_kv
-
-            per_req_query = query[:, start_q:end_q, :]
-
-            req_pool_idx = req_pool_indices[seq_idx]
-            per_req_tokens = req_to_token[req_pool_idx, start_kv:end_kv]
-            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
-            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
-
-            if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
-                per_req_key = per_req_key.to(per_req_query.dtype)
-                per_req_value = per_req_value.to(per_req_query.dtype)
-
-            per_req_out = torch.empty_like(per_req_query)
-            self._attend_per_req(
-                q=per_req_query,
-                k=per_req_key,
-                v=per_req_value,
-                out=per_req_out,
-                scaling=scaling,
-                causal=causal,
-                sliding_window_size=sliding_window_size,
-            )
-            output[start_q:end_q, :, :] = per_req_out.movedim(query.dim() - 2, 0)
-            start_q, start_kv = end_q, end_kv
-        return output
+        return self._run_sdpa_batched_attention(
+            query=query,
+            output=output,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            q_lens=[int(x) for x in extend_seq_lens],
+            encoder_lens=encoder_lens,
+            scaling=scaling,
+            causal=causal,
+            is_cross_attn=is_cross_attn,
+            sliding_window_size=sliding_window_size,
+        )
 
     def _run_sdpa_forward_decode(
         self,
@@ -462,52 +908,25 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         is_cross_attn=False,
         sliding_window_size: Optional[int] = None,
     ):
-        # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
-        query = query.movedim(0, query.dim() - 2)
-
-        start_q, start_kv = 0, 0
-        for seq_idx in range(seq_lens.shape[0]):
-            seq_len_q = 1
-            seq_len_kv = int(seq_lens[seq_idx])
-            end_q = start_q + seq_len_q
-            if encoder_lens is not None:
-                if is_cross_attn:
-                    start_kv = 0
-                    end_kv = int(encoder_lens[seq_idx])
-                else:
-                    start_kv = int(encoder_lens[seq_idx])
-                    end_kv = start_kv + seq_len_kv
-            else:
-                start_kv = 0
-                end_kv = start_kv + seq_len_kv
-
-            per_req_query = query[:, start_q:end_q, :]
-
-            req_pool_idx = req_pool_indices[seq_idx]
-            per_req_tokens = req_to_token[req_pool_idx, start_kv:end_kv]
-            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
-            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
-
-            if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
-                per_req_key = per_req_key.to(per_req_query.dtype)
-                per_req_value = per_req_value.to(per_req_query.dtype)
-
-            per_req_out = torch.empty_like(per_req_query)
-            self._attend_per_req(
-                q=per_req_query,
-                k=per_req_key,
-                v=per_req_value,
-                out=per_req_out,
-                scaling=scaling,
-                # A decode step attends all cached keys; the driver passes
-                # causal=False (every key is in the past).
-                causal=causal,
-                sliding_window_size=sliding_window_size,
-            )
-            output[start_q:end_q, :, :] = per_req_out.movedim(query.dim() - 2, 0)
-            start_q, start_kv = end_q, end_kv
-
-        return output
+        return self._run_sdpa_batched_attention(
+            query=query,
+            output=output,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            # One query token per request -- the uniform shape that makes decode
+            # bucket into a single launch.
+            q_lens=[1] * int(seq_lens.shape[0]),
+            encoder_lens=encoder_lens,
+            scaling=scaling,
+            # A decode step attends all cached keys; the driver passes
+            # causal=False (every key is in the past).
+            causal=causal,
+            is_cross_attn=is_cross_attn,
+            sliding_window_size=sliding_window_size,
+        )
 
     def support_triton(self):
         return False

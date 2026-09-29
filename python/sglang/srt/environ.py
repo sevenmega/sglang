@@ -449,6 +449,15 @@ class Envs:
     # attention backend instead of the per-head 2D-matmul loop. On any error
     # (kernel build/launch) the backend falls back to the torch loop.
     SGLANG_TPU_USE_FLASH_ATTN = EnvBool(True)
+    # Group the requests of one extend/decode forward by padded shape and give
+    # each group a single flash-attention launch (B = group size) instead of one
+    # launch per request. Requests that cannot be grouped -- or whose group fails
+    # to launch -- still run through the per-request path, so this is a pure
+    # launch-count reduction with the same fallback contract.
+    SGLANG_TPU_USE_BATCHED_FLASH_ATTN = EnvBool(True)
+    # Log every flash-attention launch (shape + batch size) to stderr, and the
+    # deduplicated union plus launch count at process exit. TEMP diagnostic.
+    SGLANG_TPU_LOG_FLASH_SHAPES = EnvBool(False)
     # The TPU device this process opens on. This is the authoritative selector:
     # the TPU platform reconciles base_gpu_id against it during ServerArgs
     # construction (see TpuSRTPlatform.apply_server_args_defaults), so setting
