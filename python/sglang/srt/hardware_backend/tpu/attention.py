@@ -50,6 +50,51 @@ _FLASH_MASK_NEG = -30000.0
 # (dynamic B/Hq/Sq/Hkv/Skv), so one build per (head-dim, scale) serves every
 # request; building invokes ppl-compile (seconds), so it runs at most once.
 _FLASH_KERNELS: dict[tuple, object] = {}
+
+# --- TEMP instrumentation: flash-attention call shapes --------------------
+# Set SGLANG_TPU_LOG_FLASH_SHAPES=1 to print every call's real + padded shape and
+# a deduplicated union at process exit. Used to see which shapes a workload
+# actually exercises (prefill vs decode, per-request vs batched).
+_FLASH_SHAPE_SET: set = set()
+_FLASH_SHAPE_LOG_ARMED = False
+
+
+def _record_flash_shape(*, hq: int, hkv: int, q_len: int, kv_len: int,
+                        q_pad: int, kv_pad: int, d: int, scaling: float) -> None:
+    global _FLASH_SHAPE_LOG_ARMED
+    import os
+    import sys
+
+    if os.environ.get("SGLANG_TPU_LOG_FLASH_SHAPES") != "1":
+        return
+    key = (hq, hkv, q_len, kv_len, q_pad, kv_pad, d, float(scaling))
+    _FLASH_SHAPE_SET.add(key)
+    print(
+        f"[FLASH-SHAPE] hq={hq} hkv={hkv} q_len={q_len} kv_len={kv_len} "
+        f"q_pad={q_pad} kv_pad={kv_pad} d={d} scale={float(scaling):.6g}",
+        file=sys.stderr,
+        flush=True,
+    )
+    if not _FLASH_SHAPE_LOG_ARMED:
+        import atexit
+
+        def _dump() -> None:
+            rows = sorted(_FLASH_SHAPE_SET)
+            print(
+                f"\n[FLASH-SHAPE] === {len(rows)} distinct flash-attention shapes ===",
+                file=sys.stderr,
+                flush=True,
+            )
+            for r in rows:
+                print(
+                    f"[FLASH-SHAPE] hq={r[0]} hkv={r[1]} q_len={r[2]} kv_len={r[3]} "
+                    f"q_pad={r[4]} kv_pad={r[5]} d={r[6]} scale={r[7]:.6g}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        atexit.register(_dump)
+        _FLASH_SHAPE_LOG_ARMED = True
 # Set once we discover the flash kernel is unavailable (import/build failure) so
 # we don't retry ppl-compile on every request.
 _FLASH_DISABLED = False
@@ -231,6 +276,10 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         )
         if kernel is None:
             return False
+        _record_flash_shape(
+            hq=num_q_heads, hkv=num_kv_heads, q_len=q_len, kv_len=kv_len,
+            q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling,
+        )
         try:
             # [H,S,D] -> [1,H,s_pad,D] fp16 host, zero-padded to the kernel tiles.
             # The dtype cast happens on the host: the device only supports
