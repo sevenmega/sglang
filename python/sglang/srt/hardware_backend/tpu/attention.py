@@ -77,11 +77,63 @@ def _pack_flash_batch(items: list, *, n_heads: int, s_pad: int) -> torch.Tensor:
 
     The dtype cast happens on the host: the device only supports same-dtype
     copies, and the kernel marshals its arguments through CPU memory anyway.
+    Retained as the fallback for the host-tensor ``__call__`` path.
     """
     d = items[0].shape[2]
     packed = torch.zeros(len(items), n_heads, s_pad, d, dtype=torch.float16)
     for i, x in enumerate(items):
         packed[i, :, : x.shape[1]] = x.detach().cpu().half()
+    return packed
+
+
+def _to_flash_fp16(x: torch.Tensor) -> torch.Tensor:
+    """Cast a device tensor to fp16 through fp32.
+
+    The device's PPL ``CopyFrom`` dispatcher has no registered bf16<->fp16
+    pair (``bf16 -> fp16`` fails with "unsupported dtype pair"), but fp32 sits
+    at the hub of the pairs it does support: bf16->fp32, fp32->fp16, and the
+    reverse all work.  Routing through fp32 is two supported conversions
+    instead of one unsupported one.  Verified on SG2260E; the model runs bf16,
+    so a bare ``.half()`` here is exactly the failing case.
+    """
+    if x.dtype == torch.float16:
+        return x
+    return x.float().half()
+
+
+def _device_cast(x: torch.Tensor, dtype: torch.dtype) -> torch.dtype:
+    """Cast a device tensor to ``dtype``, routing bf16<->fp16 through fp32.
+
+    The one unsupported pair on this device is bf16<->fp16 (see
+    :func:`_to_flash_fp16`); every other conversion, and same-dtype, is
+    direct.  The kernel returns fp16 while the model runs bf16, so the output
+    scatter hits this on every batched launch.
+    """
+    if x.dtype == dtype:
+        return x
+    pair = {x.dtype, dtype}
+    if pair == {torch.bfloat16, torch.float16}:
+        return x.float().to(dtype)
+    return x.to(dtype)
+
+
+def _pack_flash_batch_device(
+    items: list[torch.Tensor], *, n_heads: int, s_pad: int
+) -> torch.Tensor:
+    """Zero-pad a list of per-request ``[H, S_i, D]`` on-device, no H2D/D2H.
+
+    Allocates ``[N, H, s_pad, D]`` fp16 on the same device as ``items[0]``,
+    then copies each request's real rows in place with a device-side slice
+    assignment.  All work stays on the TPU; nothing touches the host.
+    """
+    dev = items[0].device
+    d = items[0].shape[-1]
+    packed = torch.zeros(
+        len(items), n_heads, s_pad, d, dtype=torch.float16, device=dev
+    )
+    for i, x in enumerate(items):
+        s_real = x.shape[1]
+        packed[i, :, :s_real, :] = _to_flash_fp16(x)
     return packed
 
 
@@ -521,9 +573,9 @@ class TpuAttnBackend(TorchNativeAttnBackend):
     @staticmethod
     def _attend_flash_batch(
         *,
-        qs: list[torch.Tensor],  # per request: [H_q, S_q, D]
-        ks: list[torch.Tensor],  # per request: [H_kv, S_kv, D]
-        vs: list[torch.Tensor],  # per request: [H_kv, S_kv, D]
+        qs: list[torch.Tensor],  # per request: [H_q, S_q, D] on-device
+        ks: list[torch.Tensor],  # per request: [H_kv, S_kv, D] on-device
+        vs: list[torch.Tensor],  # per request: [H_kv, S_kv, D] on-device
         q_lens: list[int],
         kv_lens: list[int],
         q_pad: int,
@@ -534,10 +586,17 @@ class TpuAttnBackend(TorchNativeAttnBackend):
     ) -> Optional[torch.Tensor]:
         """One flash-attention launch for a whole bucket of requests.
 
-        Returns the padded ``[B, H_q, q_pad, D]`` fp16 result, or None if the
-        launch failed. All-or-nothing: the caller falls back to the per-request
-        loop for the *whole* bucket, so no partially-batched result is ever mixed
-        into the output.
+        Returns the padded ``[B, H_q, q_pad, D]`` fp16 result on the TPU device,
+        or None if the launch failed.  All-or-nothing: the caller falls back to
+        the per-request loop for the *whole* bucket so no partially-batched
+        result is ever mixed into the output.
+
+        The device-pointer fast path (``kernel.call_device``) is tried first:
+        q/k/v are packed on-device via ``_pack_flash_batch_device``, the mask is
+        uploaded once, and raw device addresses are passed directly to the PPL
+        kernel — no per-request H2D copies.  If the kernel object does not
+        expose ``call_device`` (e.g. during autotuning or test mocking), the
+        original host-tensor ``kernel(...)`` call is used as a fallback.
         """
         num_q_heads, _, d = qs[0].shape
         num_kv_heads = ks[0].shape[0]
@@ -552,19 +611,35 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         if kernel is None:
             return None
         try:
-            q_b = _pack_flash_batch(qs, n_heads=num_q_heads, s_pad=q_pad)
-            k_b = _pack_flash_batch(ks, n_heads=num_kv_heads, s_pad=kv_pad)
-            v_b = _pack_flash_batch(vs, n_heads=num_kv_heads, s_pad=kv_pad)
-            mask = TpuAttnBackend._build_batched_additive_mask(
+            # --- device-pointer fast path -----------------------------------
+            # Pack q/k/v entirely on-device (zero-pad to padded shape, no H2D).
+            # Build the additive mask on CPU (it's a scalar-filled tensor, very
+            # cheap to construct and transfer once) then cast to fp32 device.
+            q_b = _pack_flash_batch_device(qs, n_heads=num_q_heads, s_pad=q_pad)
+            k_b = _pack_flash_batch_device(ks, n_heads=num_kv_heads, s_pad=kv_pad)
+            v_b = _pack_flash_batch_device(vs, n_heads=num_kv_heads, s_pad=kv_pad)
+            mask_cpu = TpuAttnBackend._build_batched_additive_mask(
                 q_lens=q_lens,
                 kv_lens=kv_lens,
                 q_pad=q_pad,
                 kv_pad=kv_pad,
                 causal=causal,
                 sliding_window_size=sliding_window_size,
-            ).contiguous()  # [B, q_pad, kv_pad]
+            ).contiguous()  # [B, q_pad, kv_pad] fp32, on CPU
+            # Upload mask once: [B, q_pad, kv_pad] fp32 → TPU device.
+            dev = q_b.device
+            mask = mask_cpu.to(dev)
+
             _sync_rt_device()
-            out = kernel(q_b, k_b, v_b, mask)  # [B, H_q, q_pad, D] fp16
+            if hasattr(kernel, "call_device"):
+                # All tensors already on TPU; pass device pointers directly.
+                out = kernel.call_device(q_b, k_b, v_b, mask)  # [B,Hq,q_pad,D] fp16
+            else:
+                # Fallback: host-tensor path (backward compat / test mocking).
+                out = kernel(
+                    q_b.cpu(), k_b.cpu(), v_b.cpu(), mask_cpu
+                )  # [B,Hq,q_pad,D] fp16
+
             _record_flash_launch(
                 batch=len(qs), q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling
             )
@@ -773,13 +848,20 @@ class TpuAttnBackend(TorchNativeAttnBackend):
             return False
 
         for b, plan in enumerate(plans):
-            # [H_q, q_pad, D] -> this request's [H_q, q_len, D], cast/moved on
-            # the host (out came back from the kernel in host fp16).
+            # Slice this request's real rows: [H_q, q_len, D] from the padded
+            # [B, H_q, q_pad, D] result.  ``out`` may be on the TPU device
+            # (call_device path, fp16) or on the host (legacy fallback);
+            # ``_device_cast`` handles the fp16->bf16 hop the device cannot do
+            # directly, and the .to(device) normalises the host case.
             seg = out[b, :, : plan.q_len, :]
+            if seg.device.type == "tpu":
+                seg = _device_cast(seg, output.dtype)
+            else:
+                seg = seg.to(output.dtype)
             self._scatter_plan_output(
                 output=output,
                 plan=plan,
-                per_req_out=seg.to(output.dtype).to(output.device),
+                per_req_out=seg.to(output.device),
             )
         return True
 
