@@ -399,6 +399,24 @@ def _get_flash_kernel(
     return kern
 
 
+def _resolve_call_device(kernel):
+    """Return the kernel's ``call_device`` (device-pointer launch), or None.
+
+    ``_get_flash_kernel`` returns a tilelang ``JITKernel``, which does not expose
+    ``call_device`` directly -- it lives on the underlying ``TPUKernel`` and is
+    forwarded by the ``PPLKernelAdapter`` at ``kernel.adapter``.  Checking the
+    adapter is what keeps the no-copy fast path reachable; without this the
+    batched launch silently falls back to the host-tensor path (device pack,
+    then ``.cpu()`` round trip), which is the slow path this whole change exists
+    to avoid.  Returns None for mock/test kernels that have neither.
+    """
+    fn = getattr(kernel, "call_device", None)
+    if fn is not None:
+        return fn
+    adapter = getattr(kernel, "adapter", None)
+    return getattr(adapter, "call_device", None)
+
+
 class TpuAttnBackend(TorchNativeAttnBackend):
     """Per-head 2D-matmul attention for the Sophgo TPU device."""
 
@@ -470,17 +488,32 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         masks = torch.full(
             (len(q_lens), q_pad, kv_pad), _FLASH_MASK_NEG, dtype=torch.float32
         )
+        # Requests in one bucket usually share (q_len, kv_len) -- in homogeneous
+        # prefill all of them do -- so the per-request block is often identical.
+        # Build each distinct block once and reuse it; rebuilding it per request
+        # was 31/32 redundant work on the benchmarked prefill (16.8 ms measured
+        # for a mask that only has one distinct value). ``causal`` and the window
+        # are constant across the call, so the key is just (q_len, kv_len).
+        cache: dict[tuple[int, int], Optional[torch.Tensor]] = {}
         for b, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens)):
-            per_req = TpuAttnBackend._build_additive_mask(
-                q_len=q_len,
-                kv_len=kv_len,
-                causal=causal,
-                sliding_window_size=sliding_window_size,
-            )
+            key = (q_len, kv_len)
+            if key not in cache:
+                per_req = TpuAttnBackend._build_additive_mask(
+                    q_len=q_len,
+                    kv_len=kv_len,
+                    causal=causal,
+                    sliding_window_size=sliding_window_size,
+                )
+                # Clamp once here rather than on every copy (a fresh tensor per
+                # assignment otherwise).
+                if per_req is not None:
+                    per_req = per_req.clamp_min(_FLASH_MASK_NEG)
+                cache[key] = per_req
+            per_req = cache[key]
             # ``None`` means "no constraint at all" (decode attending every
             # cached key), i.e. an all-zero real block.
             if per_req is not None:
-                masks[b, :q_len, :kv_len] = per_req.clamp_min(_FLASH_MASK_NEG)
+                masks[b, :q_len, :kv_len] = per_req
             else:
                 masks[b, :q_len, :kv_len] = 0.0
             masks[b, q_len:, :] = 0.0
@@ -665,9 +698,10 @@ class TpuAttnBackend(TorchNativeAttnBackend):
             mask = mask_cpu.to(dev)
 
             _sync_rt_device()
-            if hasattr(kernel, "call_device"):
+            dev_call = _resolve_call_device(kernel)
+            if dev_call is not None:
                 # All tensors already on TPU; pass device pointers directly.
-                out = kernel.call_device(q_b, k_b, v_b, mask)
+                out = dev_call(q_b, k_b, v_b, mask)
             else:
                 # Fallback: host-tensor path (backward compat / test mocking).
                 out = kernel(q_b.cpu(), k_b.cpu(), v_b.cpu(), mask_cpu)
