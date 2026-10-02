@@ -72,68 +72,67 @@ def _flash_pad_lens(q_len: int, kv_len: int) -> tuple[int, int]:
     return q_pad, max(q_pad, kv_pad)
 
 
-def _pack_flash_batch(items: list, *, n_heads: int, s_pad: int) -> torch.Tensor:
-    """Zero-pad a list of per-request ``[H, S_i, D]`` into ``[N, H, s_pad, D]`` fp16.
+def _flash_dtype_of(x: torch.Tensor) -> torch.dtype:
+    """The dtype the flash kernel should be built in, given an activation.
 
-    The dtype cast happens on the host: the device only supports same-dtype
-    copies, and the kernel marshals its arguments through CPU memory anyway.
-    Retained as the fallback for the host-tensor ``__call__`` path.
+    The kernel is compiled once per dtype, so this must be derived from the
+    model's actual activations (Qwen3-0.6B is bf16).  Anything other than fp16
+    falls back to fp16, which is the kernel's long-standing default.
     """
-    d = items[0].shape[2]
-    packed = torch.zeros(len(items), n_heads, s_pad, d, dtype=torch.float16)
-    for i, x in enumerate(items):
-        packed[i, :, : x.shape[1]] = x.detach().cpu().half()
-    return packed
+    return x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.float16
 
 
-def _to_flash_fp16(x: torch.Tensor) -> torch.Tensor:
-    """Cast a device tensor to fp16 through fp32.
+def _to_flash_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Cast a device tensor to the flash kernel's dtype.
 
     The device's PPL ``CopyFrom`` dispatcher has no registered bf16<->fp16
     pair (``bf16 -> fp16`` fails with "unsupported dtype pair"), but fp32 sits
     at the hub of the pairs it does support: bf16->fp32, fp32->fp16, and the
     reverse all work.  Routing through fp32 is two supported conversions
-    instead of one unsupported one.  Verified on SG2260E; the model runs bf16,
-    so a bare ``.half()`` here is exactly the failing case.
+    instead of one unsupported one.
+
+    With the kernel built in the model's own dtype (bf16 for Qwen3) this is a
+    no-op and no conversion happens at all; it stays as the guard for the fp16
+    kernel path.
     """
-    if x.dtype == torch.float16:
+    if x.dtype == dtype:
         return x
-    return x.float().half()
+    if {x.dtype, dtype} == {torch.bfloat16, torch.float16}:
+        return x.float().to(dtype)
+    return x.to(dtype)
 
 
 def _device_cast(x: torch.Tensor, dtype: torch.dtype) -> torch.dtype:
     """Cast a device tensor to ``dtype``, routing bf16<->fp16 through fp32.
 
-    The one unsupported pair on this device is bf16<->fp16 (see
-    :func:`_to_flash_fp16`); every other conversion, and same-dtype, is
-    direct.  The kernel returns fp16 while the model runs bf16, so the output
-    scatter hits this on every batched launch.
+    Same constraint as :func:`_to_flash_dtype`; kept as a distinct name because
+    the call sites read differently (kernel output -> model dtype vs. gathered
+    q/k/v -> kernel dtype).
     """
-    if x.dtype == dtype:
-        return x
-    pair = {x.dtype, dtype}
-    if pair == {torch.bfloat16, torch.float16}:
-        return x.float().to(dtype)
-    return x.to(dtype)
+    return _to_flash_dtype(x, dtype)
 
 
 def _pack_flash_batch_device(
-    items: list[torch.Tensor], *, n_heads: int, s_pad: int
+    items: list[torch.Tensor], *, n_heads: int, s_pad: int, dtype: torch.dtype
 ) -> torch.Tensor:
     """Zero-pad a list of per-request ``[H, S_i, D]`` on-device, no H2D/D2H.
 
-    Allocates ``[N, H, s_pad, D]`` fp16 on the same device as ``items[0]``,
-    then copies each request's real rows in place with a device-side slice
-    assignment.  All work stays on the TPU; nothing touches the host.
+    Allocates ``[N, H, s_pad, D]`` in ``dtype`` on the same device as
+    ``items[0]``, then copies each request's real rows in place with a
+    device-side slice assignment.  All work stays on the TPU; nothing touches
+    the host.
+
+    ``dtype`` is the flash kernel's buffer dtype, so when it matches the model
+    activations (bf16) every assignment is a plain same-dtype strided copy.
     """
     dev = items[0].device
     d = items[0].shape[-1]
     packed = torch.zeros(
-        len(items), n_heads, s_pad, d, dtype=torch.float16, device=dev
+        len(items), n_heads, s_pad, d, dtype=dtype, device=dev
     )
     for i, x in enumerate(items):
         s_real = x.shape[1]
-        packed[i, :, :s_real, :] = _to_flash_fp16(x)
+        packed[i, :, :s_real, :] = _to_flash_dtype(x, dtype)
     return packed
 
 
@@ -339,16 +338,32 @@ def _bucket_attention_plans(
     return list(buckets.values())
 
 
+def _dtype_name(dtype: torch.dtype) -> str:
+    """torch dtype -> the bare name the tilelang factory parses.
+
+    ``str(torch.bfloat16)`` is ``"torch.bfloat16"``, which ``T.dtype`` rejects
+    with "unknown dtype"; it wants ``"bfloat16"``.
+    """
+    return str(dtype).replace("torch.", "")
+
+
 def _get_flash_kernel(
-    *, hq: int, sq: int, skv: int, d: int, hkv: int, scaling: float
+    *, hq: int, sq: int, skv: int, d: int, hkv: int, scaling: float,
+    dtype: torch.dtype = torch.float16,
 ):
     """Return a cached tilelang flash kernel, or None if tilelang is unavailable.
 
     The DSL kernel is **shape-generic**: ``B/Hq/Sq/Hkv/Skv`` are dynamic, so a
     single build serves every request. Only ``d`` (head dim, which sizes the
-    on-chip tiles) and ``scaling`` (baked as ``sm_scale``) are compile-time, so
-    the cache key is just ``(d, scaling)`` — ``hq``/``sq``/``skv``/``hkv`` are
-    accepted for call-site symmetry but do not trigger a rebuild.
+    on-chip tiles), ``scaling`` (baked as ``sm_scale``) and ``dtype`` (sizes the
+    global-buffer element type) are compile-time, so the cache key is
+    ``(d, scaling, dtype)`` — ``hq``/``sq``/``skv``/``hkv`` are accepted for
+    call-site symmetry but do not trigger a rebuild.
+
+    ``dtype`` should be the model's activation dtype (Qwen3-0.6B is bf16).
+    Building the kernel in the model's own dtype removes the bf16<->fp16
+    conversions at the call boundary entirely, which matters because the device
+    has no registered PPL copy for that pair — see :func:`_device_cast`.
 
     ``sq``/``skv`` must still be padded to the kernel's tile sizes (see
     :meth:`TpuAttnBackend._attend_flash`); the DSL kernel does not clamp partial
@@ -357,7 +372,7 @@ def _get_flash_kernel(
     global _FLASH_DISABLED
     if _FLASH_DISABLED:
         return None
-    key = (d, float(scaling))
+    key = (d, float(scaling), _dtype_name(dtype))
     kern = _FLASH_KERNELS.get(key)
     if kern is None:
         try:
@@ -369,7 +384,9 @@ def _get_flash_kernel(
 
             # Lazy factory call (dynamic-shape idiom): compiles one generic
             # kernel; runtime dims are resolved per call from the input shapes.
-            kern = flash_attention_gqa(d=d, sm_scale=float(scaling))
+            kern = flash_attention_gqa(
+                d=d, sm_scale=float(scaling), dtype=_dtype_name(dtype)
+            )
             _FLASH_KERNELS[key] = kern
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -492,6 +509,7 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         """
         num_q_heads, q_len, d = q.shape
         num_kv_heads, kv_len, _ = k.shape
+        act_dtype = _flash_dtype_of(q)
 
         block_m, block_n = 8, 128
         q_pad = -(-q_len // block_m) * block_m  # ceil to block_M
@@ -506,6 +524,7 @@ class TpuAttnBackend(TorchNativeAttnBackend):
             d=d,
             hkv=num_kv_heads,
             scaling=scaling,
+            dtype=act_dtype,
         )
         if kernel is None:
             return False
@@ -514,13 +533,18 @@ class TpuAttnBackend(TorchNativeAttnBackend):
             q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling,
         )
         try:
-            # [H,S,D] -> [1,H,s_pad,D] fp16 host, zero-padded to the kernel tiles.
-            # The dtype cast happens on the host: the device only supports
-            # same-dtype copies, and the kernel marshals its arguments through
-            # CPU memory regardless.
+            # [H,S,D] -> [1,H,s_pad,D] host, zero-padded to the kernel tiles and
+            # in the kernel's own dtype. The host casts (a plain torch op) fold
+            # bf16->fp16 etc. here, where they are free, instead of on-device
+            # where the PPL copy dispatcher has no bf16<->fp16 pair.
             def _pad(x, n_heads, s_pad):  # [H,S,D] -> [1,H,s_pad,D]
-                padded = torch.zeros(1, n_heads, s_pad, d, dtype=torch.float16)
-                padded[0, :, : x.shape[1]] = x.detach().cpu().half()
+                padded = torch.zeros(
+                    1, n_heads, s_pad, d, dtype=act_dtype,
+                )
+                x_cpu = x.detach().cpu()
+                if x_cpu.dtype != padded.dtype:
+                    x_cpu = x_cpu.float().to(padded.dtype)
+                padded[0, :, : x.shape[1]] = x_cpu
                 return padded
 
             q_b = _pad(q, num_q_heads, q_pad)
@@ -600,6 +624,7 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         """
         num_q_heads, _, d = qs[0].shape
         num_kv_heads = ks[0].shape[0]
+        act_dtype = _flash_dtype_of(qs[0])
         kernel = _get_flash_kernel(
             hq=num_q_heads,
             sq=q_pad,
@@ -607,17 +632,25 @@ class TpuAttnBackend(TorchNativeAttnBackend):
             d=d,
             hkv=num_kv_heads,
             scaling=scaling,
+            dtype=act_dtype,
         )
         if kernel is None:
             return None
         try:
             # --- device-pointer fast path -----------------------------------
             # Pack q/k/v entirely on-device (zero-pad to padded shape, no H2D).
-            # Build the additive mask on CPU (it's a scalar-filled tensor, very
-            # cheap to construct and transfer once) then cast to fp32 device.
-            q_b = _pack_flash_batch_device(qs, n_heads=num_q_heads, s_pad=q_pad)
-            k_b = _pack_flash_batch_device(ks, n_heads=num_kv_heads, s_pad=kv_pad)
-            v_b = _pack_flash_batch_device(vs, n_heads=num_kv_heads, s_pad=kv_pad)
+            # Built in the kernel's own dtype, so when it matches the model
+            # activations every assignment is a same-dtype strided copy and no
+            # conversion happens at all.
+            q_b = _pack_flash_batch_device(
+                qs, n_heads=num_q_heads, s_pad=q_pad, dtype=act_dtype
+            )
+            k_b = _pack_flash_batch_device(
+                ks, n_heads=num_kv_heads, s_pad=kv_pad, dtype=act_dtype
+            )
+            v_b = _pack_flash_batch_device(
+                vs, n_heads=num_kv_heads, s_pad=kv_pad, dtype=act_dtype
+            )
             mask_cpu = TpuAttnBackend._build_batched_additive_mask(
                 q_lens=q_lens,
                 kv_lens=kv_lens,
@@ -626,19 +659,18 @@ class TpuAttnBackend(TorchNativeAttnBackend):
                 causal=causal,
                 sliding_window_size=sliding_window_size,
             ).contiguous()  # [B, q_pad, kv_pad] fp32, on CPU
-            # Upload mask once: [B, q_pad, kv_pad] fp32 → TPU device.
+            # Upload mask once: [B, q_pad, kv_pad] fp32 → TPU device. The mask
+            # is fp32 in both kernels (accum_dtype), so no conversion.
             dev = q_b.device
             mask = mask_cpu.to(dev)
 
             _sync_rt_device()
             if hasattr(kernel, "call_device"):
                 # All tensors already on TPU; pass device pointers directly.
-                out = kernel.call_device(q_b, k_b, v_b, mask)  # [B,Hq,q_pad,D] fp16
+                out = kernel.call_device(q_b, k_b, v_b, mask)
             else:
                 # Fallback: host-tensor path (backward compat / test mocking).
-                out = kernel(
-                    q_b.cpu(), k_b.cpu(), v_b.cpu(), mask_cpu
-                )  # [B,Hq,q_pad,D] fp16
+                out = kernel(q_b.cpu(), k_b.cpu(), v_b.cpu(), mask_cpu)
 
             _record_flash_launch(
                 batch=len(qs), q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling

@@ -149,10 +149,9 @@ def main():
     cls._scatter_plan_output = staticmethod(timed("scatter", orig_scatter_fn))
 
     pack_calls = []
-    # Both pack variants are timed: the device-pointer fast path calls
-    # ``_pack_flash_batch_device``, the host fallback calls ``_pack_flash_batch``.
-    # Timing only one would report 0 for pack and hide where the time went.
-    orig_pack = attn_mod._pack_flash_batch
+    # Only the device packer exists now: the host-side ``_pack_flash_batch`` was
+    # removed once the kernel was built in the model's own dtype (bf16), which
+    # made the conversion it performed unnecessary.
     orig_pack_dev = attn_mod._pack_flash_batch_device
 
     def _timed(fn):
@@ -165,7 +164,6 @@ def main():
             return r
         return wrapper
 
-    attn_mod._pack_flash_batch = _timed(orig_pack)
     attn_mod._pack_flash_batch_device = _timed(orig_pack_dev)
 
     def run_attn():
