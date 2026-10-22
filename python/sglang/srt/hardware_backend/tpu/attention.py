@@ -50,9 +50,10 @@ _FLASH_MASK_NEG = -30000.0
 # The tilelang kernel's fixed on-chip tiles: block_M query rows, block_N keys.
 # It does not clamp partial tiles, so every tile it loads must be fully in range
 # -- hence the padding to these multiples. Keep in sync with
-# ``tilelang.tpu.kernels.attention.flash_attention_gqa``.
-_FLASH_BLOCK_M = 8
-_FLASH_BLOCK_N = 128
+# ``tilelang.tpu.kernels.attention.flash_attention_gqa``: these must equal its
+# ``block_M`` / ``block_N`` defaults, or a launch reads past the packed buffer.
+_FLASH_BLOCK_M = 64
+_FLASH_BLOCK_N = 256
 
 # Cap on how many requests one batched launch covers. The kernel itself is happy
 # with any B, but the driver materializes [B, H, S_pad, D] fp16 host buffers for
@@ -212,55 +213,6 @@ def _record_flash_launch(*, batch: int, q_pad: int, kv_pad: int, d: int,
 # we don't retry ppl-compile on every request.
 _FLASH_DISABLED = False
 
-# The PPL wrapper binds its stream/device in ``py_init_device`` (once, at kernel
-# build) from ``TPU_VISIBLE_DEVICES``, but the torch_tpu runtime keeps its own
-# "current device" and silently drifts it -- notably to a *stale* index -- after
-# any device-tensor alloc or copy. The next PPL launch then dies in
-# ``tpuRtSendLaunchKernelMsg`` with "stream and device mismatch!". Re-asserting
-# the device through the runtime's own API immediately before each launch puts
-# the two back in agreement. Resolved lazily so this module imports without the
-# TPU runtime present.
-_TPURT_SET_DEVICE = None
-
-
-def _rt_device() -> int:
-    """The visible device index the PPL wrapper's stream is bound to."""
-    import os
-
-    return int(os.environ.get("TPU_VISIBLE_DEVICES", "0").split(",")[0])
-
-
-def _sync_rt_device() -> None:
-    """Re-point the PPL runtime's current device at the one its stream uses.
-
-    Must be called immediately before every PPL kernel launch, and after any
-    torch_tpu device-tensor operation. A no-op if the runtime API is missing.
-    """
-    global _TPURT_SET_DEVICE
-    if _TPURT_SET_DEVICE is None:
-        try:
-            import ctypes
-
-            # The runtime is already mapped by torch_tpu (CDLL(None) searches
-            # the global namespace), and re-opening the .so by path would pull
-            # in libbmlib.so.0, which is not on the loader path here.
-            lib = ctypes.CDLL(None, mode=ctypes.RTLD_GLOBAL)
-            fn = lib.tpuRtSetDevice
-            fn.argtypes = [ctypes.c_int]
-            fn.restype = ctypes.c_int
-            _TPURT_SET_DEVICE = fn
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[TPU] cannot re-assert the PPL runtime device (%s); "
-                "repeat launches may fail.",
-                exc,
-            )
-            _TPURT_SET_DEVICE = False  # tried and failed; don't retry
-            return
-    if _TPURT_SET_DEVICE is False:
-        return
-    _TPURT_SET_DEVICE(_rt_device())
-
 
 class _AttnReqPlan(msgspec.Struct, frozen=True):
     """Where one request's query and KV live in the paged buffers.
@@ -354,11 +306,16 @@ def _get_flash_kernel(
     """Return a cached tilelang flash kernel, or None if tilelang is unavailable.
 
     The DSL kernel is **shape-generic**: ``B/Hq/Sq/Hkv/Skv`` are dynamic, so a
-    single build serves every request. Only ``d`` (head dim, which sizes the
-    on-chip tiles), ``scaling`` (baked as ``sm_scale``) and ``dtype`` (sizes the
-    global-buffer element type) are compile-time, so the cache key is
-    ``(d, scaling, dtype)`` — ``hq``/``sq``/``skv``/``hkv`` are accepted for
-    call-site symmetry but do not trigger a rebuild.
+    single build serves every request. Only ``d`` (head dim), ``scaling`` (baked
+    as ``sm_scale``), ``dtype`` (global-buffer element type) and the tile sizes
+    are compile-time, so the cache key is ``(d, scaling, dtype)`` — hq/sq/skv/
+    hkv are accepted for call-site symmetry but do not trigger a rebuild.
+
+    The tile sizes are passed explicitly (rather than relying on the kernel's
+    defaults) so the padding in :func:`_flash_pad_lens` and the kernel's tile
+    extents cannot drift apart. They historically did: the kernel moved to
+    64/256 while this module still padded to 8/128, which made the kernel read a
+    256-key tile out of a 128-key buffer and produce NaN.
 
     ``dtype`` should be the model's activation dtype (Qwen3-0.6B is bf16).
     Building the kernel in the model's own dtype removes the bf16<->fp16
@@ -372,7 +329,8 @@ def _get_flash_kernel(
     global _FLASH_DISABLED
     if _FLASH_DISABLED:
         return None
-    key = (d, float(scaling), _dtype_name(dtype))
+    block_m, block_n = _FLASH_BLOCK_M, _FLASH_BLOCK_N
+    key = (d, float(scaling), _dtype_name(dtype), block_m, block_n)
     kern = _FLASH_KERNELS.get(key)
     if kern is None:
         try:
@@ -385,7 +343,11 @@ def _get_flash_kernel(
             # Lazy factory call (dynamic-shape idiom): compiles one generic
             # kernel; runtime dims are resolved per call from the input shapes.
             kern = flash_attention_gqa(
-                d=d, sm_scale=float(scaling), dtype=_dtype_name(dtype)
+                d=d,
+                block_M=block_m,
+                block_N=block_n,
+                sm_scale=float(scaling),
+                dtype=_dtype_name(dtype),
             )
             _FLASH_KERNELS[key] = kern
         except Exception as exc:  # noqa: BLE001
@@ -397,24 +359,6 @@ def _get_flash_kernel(
             _FLASH_DISABLED = True
             return None
     return kern
-
-
-def _resolve_call_device(kernel):
-    """Return the kernel's ``call_device`` (device-pointer launch), or None.
-
-    ``_get_flash_kernel`` returns a tilelang ``JITKernel``, which does not expose
-    ``call_device`` directly -- it lives on the underlying ``TPUKernel`` and is
-    forwarded by the ``PPLKernelAdapter`` at ``kernel.adapter``.  Checking the
-    adapter is what keeps the no-copy fast path reachable; without this the
-    batched launch silently falls back to the host-tensor path (device pack,
-    then ``.cpu()`` round trip), which is the slow path this whole change exists
-    to avoid.  Returns None for mock/test kernels that have neither.
-    """
-    fn = getattr(kernel, "call_device", None)
-    if fn is not None:
-        return fn
-    adapter = getattr(kernel, "adapter", None)
-    return getattr(adapter, "call_device", None)
 
 
 class TpuAttnBackend(TorchNativeAttnBackend):
@@ -434,31 +378,42 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         kv_len: int,
         causal: bool,
         sliding_window_size: Optional[int],
+        device,
     ) -> Optional[torch.Tensor]:
-        """Build an additive [q_len, kv_len] float mask on CPU, or None.
+        """Build an additive [q_len, kv_len] float mask on ``device``, or None.
 
         Query token ``i`` sits at absolute position ``query_offset + i`` where
         ``query_offset = kv_len - q_len`` (the extend tokens are the tail of the
-        sequence; for decode ``q_len == 1``). A key ``j`` is disallowed (masked to
-        ``_MASK_NEG``) when it is in the future (``j > pos``) or, for sliding
-        window, older than the window (``j < pos - window``).
+        sequence; for decode ``q_len == 1``). A key ``j`` is disallowed (masked
+        to ``_FLASH_MASK_NEG``) when it is in the future (``j > pos``) or, for
+        sliding window, older than the window (``j < pos - window``).
+
+        Built on the target device: the whole construction is elementwise
+        indexing/compare/fill, so it never needs host memory.  The fill value is
+        already fp16-safe, so callers can pass the result straight to the flash
+        kernel.
         """
         has_window = sliding_window_size is not None and sliding_window_size > -1
         if not causal and not has_window:
             return None
 
         query_offset = kv_len - q_len
-        pos = torch.arange(q_len).unsqueeze(1) + query_offset  # [q_len, 1]
-        j = torch.arange(kv_len).unsqueeze(0)  # [1, kv_len]
+        # [q_len, 1] + int -> broadcast positions; [1, kv_len] for keys.
+        pos = torch.arange(q_len, device=device).unsqueeze(1) + query_offset
+        j = torch.arange(kv_len, device=device).unsqueeze(0)
 
-        disallowed = torch.zeros(q_len, kv_len, dtype=torch.bool)
+        disallowed = torch.zeros(q_len, kv_len, dtype=torch.bool, device=device)
         if causal:
             disallowed |= j > pos
         if has_window:
             disallowed |= j < pos - sliding_window_size
 
-        mask = torch.zeros(q_len, kv_len, dtype=torch.float32)
-        mask.masked_fill_(disallowed, _MASK_NEG)
+        mask = torch.zeros(q_len, kv_len, dtype=torch.float32, device=device)
+        # ``_FLASH_MASK_NEG``, not ``_MASK_NEG``: -1e9 overflows fp16, and the
+        # flash kernel computes in fp16 internally, so a raw -1e9 reaches it as
+        # -inf and the softmax produces NaN. Clamping here (rather than at each
+        # call site) covers both the aligned and the padded paths.
+        mask.masked_fill_(disallowed, _FLASH_MASK_NEG)
         return mask
 
     @staticmethod
@@ -470,6 +425,7 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         kv_pad: int,
         causal: bool,
         sliding_window_size: Optional[int],
+        device,
     ) -> torch.Tensor:
         """Assemble the block-diagonal ``[B, q_pad, kv_pad]`` additive mask.
 
@@ -483,10 +439,16 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         m_cur, dim=1)`` -- so a padded row cannot perturb a real one) and keeps
         the padded rows' arithmetic away from the masked-exponent path. Those
         rows' outputs are sliced off regardless.
+
+        Built entirely on ``device``: there is no host-side assembly and no
+        upload, so the mask never crosses the PCIe boundary.
         """
         assert len(q_lens) == len(kv_lens)
         masks = torch.full(
-            (len(q_lens), q_pad, kv_pad), _FLASH_MASK_NEG, dtype=torch.float32
+            (len(q_lens), q_pad, kv_pad),
+            _FLASH_MASK_NEG,
+            dtype=torch.float32,
+            device=device,
         )
         # Requests in one bucket usually share (q_len, kv_len) -- in homogeneous
         # prefill all of them do -- so the per-request block is often identical.
@@ -503,11 +465,8 @@ class TpuAttnBackend(TorchNativeAttnBackend):
                     kv_len=kv_len,
                     causal=causal,
                     sliding_window_size=sliding_window_size,
+                    device=device,
                 )
-                # Clamp once here rather than on every copy (a fresh tensor per
-                # assignment otherwise).
-                if per_req is not None:
-                    per_req = per_req.clamp_min(_FLASH_MASK_NEG)
                 cache[key] = per_req
             per_req = cache[key]
             # ``None`` means "no constraint at all" (decode attending every
@@ -527,24 +486,28 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         v: torch.Tensor,  # [H_kv, S_kv, D]
         out: torch.Tensor,  # [H_q, S_q, D] (written in place)
         scaling: float,
-        cpu_mask: Optional[torch.Tensor],  # [S_q, S_kv] additive, or None
+        cpu_mask: Optional[torch.Tensor],  # [S_q, S_kv] additive on-device, or None
     ) -> bool:
         """Try the tilelang PPL flash-attention kernel. Returns True on success
         (``out`` written), False to fall back to the per-head matmul loop.
 
-        The DSL kernel has fixed on-chip tiles (block_M=8 rows of queries,
-        block_N=128 keys) and no partial-tile clamping, so ``S_q``/``S_kv`` are
-        padded up to those multiples here and sliced back afterwards. Padded
-        query rows and padded keys are written as zeros in q/k/v; the mask's
-        padded *key columns* are set to ``-30000`` so a real query never puts
-        softmax mass on a padded key (whose V is meaningless). Padded *query
-        rows* need no masking -- their outputs are sliced off.
+        The DSL kernel has fixed on-chip tiles (``_FLASH_BLOCK_M`` rows of
+        queries, ``_FLASH_BLOCK_N`` keys) and no partial-tile clamping, so
+        ``S_q``/``S_kv`` are padded up to those multiples here and sliced back
+        afterwards. Padded query rows and padded keys are written as zeros in
+        q/k/v; the mask's padded *key columns* are set to ``-30000`` so a real
+        query never puts softmax mass on a padded key (whose V is meaningless).
+        Padded *query rows* need no masking -- their outputs are sliced off.
+
+        Everything stays on the device: q/k/v are packed with
+        :func:`_pack_flash_batch_device` and the kernel launches with device
+        pointers, so no tensor crosses the PCIe boundary.
         """
         num_q_heads, q_len, d = q.shape
         num_kv_heads, kv_len, _ = k.shape
         act_dtype = _flash_dtype_of(q)
 
-        block_m, block_n = 8, 128
+        block_m, block_n = _FLASH_BLOCK_M, _FLASH_BLOCK_N
         q_pad = -(-q_len // block_m) * block_m  # ceil to block_M
         kv_pad = -(-kv_len // block_n) * block_n  # ceil to block_N
         if kv_pad < q_pad:  # the mask builder needs query_offset >= 0
@@ -566,31 +529,28 @@ class TpuAttnBackend(TorchNativeAttnBackend):
             q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling,
         )
         try:
-            # [H,S,D] -> [1,H,s_pad,D] host, zero-padded to the kernel tiles and
-            # in the kernel's own dtype. The host casts (a plain torch op) fold
-            # bf16->fp16 etc. here, where they are free, instead of on-device
-            # where the PPL copy dispatcher has no bf16<->fp16 pair.
-            def _pad(x, n_heads, s_pad):  # [H,S,D] -> [1,H,s_pad,D]
-                padded = torch.zeros(
-                    1, n_heads, s_pad, d, dtype=act_dtype,
-                )
-                x_cpu = x.detach().cpu()
-                if x_cpu.dtype != padded.dtype:
-                    x_cpu = x_cpu.float().to(padded.dtype)
-                padded[0, :, : x.shape[1]] = x_cpu
-                return padded
+            # [H,S,D] -> [1,H,s_pad,D], zero-padded to the kernel tiles and in
+            # the kernel's own dtype, entirely on-device.
+            q_b = _pack_flash_batch_device(
+                [q], n_heads=num_q_heads, s_pad=q_pad, dtype=act_dtype
+            )
+            k_b = _pack_flash_batch_device(
+                [k], n_heads=num_kv_heads, s_pad=kv_pad, dtype=act_dtype
+            )
+            v_b = _pack_flash_batch_device(
+                [v], n_heads=num_kv_heads, s_pad=kv_pad, dtype=act_dtype
+            )
 
-            q_b = _pad(q, num_q_heads, q_pad)
-            k_b = _pad(k, num_kv_heads, kv_pad)
-            v_b = _pad(v, num_kv_heads, kv_pad)
-
+            device = out.device
             if cpu_mask is not None:
-                m = cpu_mask.float().clamp_min(_FLASH_MASK_NEG).cpu()
+                m = _device_cast(cpu_mask.float(), torch.float32).clamp_min(
+                    _FLASH_MASK_NEG
+                )
             else:
                 # No constraint at all (decode attends every cached key): the
                 # real block is all-zeros, and the padded key columns below are
                 # masked off.
-                m = torch.zeros(q_len, kv_len, dtype=torch.float32)
+                m = torch.zeros(q_len, kv_len, dtype=torch.float32, device=device)
 
             if q_pad != q_len or kv_pad != kv_len:
                 # Mask row r <-> query row r, column j <-> key j (the kernel
@@ -600,24 +560,26 @@ class TpuAttnBackend(TorchNativeAttnBackend):
                 # over a whole query tile -- an all-(-30000) row would make the
                 # tile-wide max -30000 and blank the real rows beside it.
                 padded = torch.full(
-                    (q_pad, kv_pad), _FLASH_MASK_NEG, dtype=torch.float32
+                    (q_pad, kv_pad),
+                    _FLASH_MASK_NEG,
+                    dtype=torch.float32,
+                    device=device,
                 )
                 padded[:q_len, :kv_len] = m
                 padded[q_len:, :] = 0.0
                 m = padded
             mask = m.unsqueeze(0).contiguous()  # [1, S_q, S_kv]
 
-            # Any device-tensor op above (there should be none -- this path
-            # marshals through CPU memory) would desync the PPL runtime's
-            # current device from its stream. Re-assert it before launching.
-            _sync_rt_device()
-            res = kernel(q_b, k_b, v_b, mask)  # [1,Hq,q_pad,D] fp16
+            # The kernel launches with device addresses; run_device_ptrs
+            # re-asserts the PPL runtime's device immediately before the launch,
+            # so no caller-side _sync_rt_device is needed.
+            res = kernel(q_b, k_b, v_b, mask)  # [1,Hq,q_pad,D] on device
             _record_flash_launch(
                 batch=1, q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling
             )
-            # [1,Hq,q_pad,D] -> [Hq,q_len,D]; cast + move on the host.
+            # [1,Hq,q_pad,D] -> [Hq,q_len,D], still on device.
             resc = res[0, :, :q_len].contiguous()
-            out.copy_(resc.to(out.dtype).to(out.device))
+            out.copy_(_device_cast(resc, out.dtype))
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -648,12 +610,9 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         the per-request loop for the *whole* bucket so no partially-batched
         result is ever mixed into the output.
 
-        The device-pointer fast path (``kernel.call_device``) is tried first:
         q/k/v are packed on-device via ``_pack_flash_batch_device``, the mask is
-        uploaded once, and raw device addresses are passed directly to the PPL
-        kernel — no per-request H2D copies.  If the kernel object does not
-        expose ``call_device`` (e.g. during autotuning or test mocking), the
-        original host-tensor ``kernel(...)`` call is used as a fallback.
+        built on-device, and raw device addresses are passed straight to the PPL
+        kernel — no per-request H2D copies and no host marshalling anywhere.
         """
         num_q_heads, _, d = qs[0].shape
         num_kv_heads = ks[0].shape[0]
@@ -684,27 +643,21 @@ class TpuAttnBackend(TorchNativeAttnBackend):
             v_b = _pack_flash_batch_device(
                 vs, n_heads=num_kv_heads, s_pad=kv_pad, dtype=act_dtype
             )
-            mask_cpu = TpuAttnBackend._build_batched_additive_mask(
+            # Mask is built on the device and passed by pointer — no host
+            # assembly, no upload.  It is fp32 in both kernels (accum_dtype).
+            mask = TpuAttnBackend._build_batched_additive_mask(
                 q_lens=q_lens,
                 kv_lens=kv_lens,
                 q_pad=q_pad,
                 kv_pad=kv_pad,
                 causal=causal,
                 sliding_window_size=sliding_window_size,
-            ).contiguous()  # [B, q_pad, kv_pad] fp32, on CPU
-            # Upload mask once: [B, q_pad, kv_pad] fp32 → TPU device. The mask
-            # is fp32 in both kernels (accum_dtype), so no conversion.
-            dev = q_b.device
-            mask = mask_cpu.to(dev)
+                device=q_b.device,
+            ).contiguous()  # [B, q_pad, kv_pad] fp32, on device
 
-            _sync_rt_device()
-            dev_call = _resolve_call_device(kernel)
-            if dev_call is not None:
-                # All tensors already on TPU; pass device pointers directly.
-                out = dev_call(q_b, k_b, v_b, mask)
-            else:
-                # Fallback: host-tensor path (backward compat / test mocking).
-                out = kernel(q_b.cpu(), k_b.cpu(), v_b.cpu(), mask_cpu)
+            # Device pointers only: run_device_ptrs re-asserts the runtime's
+            # device right before the launch.
+            out = kernel(q_b, k_b, v_b, mask)  # [B, Hq, q_pad, D] on device
 
             _record_flash_launch(
                 batch=len(qs), q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling
@@ -734,19 +687,20 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         num_kv_heads, kv_len, _ = k.shape
         group_size = num_q_heads // num_kv_heads
 
-        cpu_mask = self._build_additive_mask(
+        # Device-resident mask: the flash path consumes it directly, and the
+        # matmul fallback below adds it on-device too.  No host round trip.
+        mask = self._build_additive_mask(
             q_len=q_len,
             kv_len=kv_len,
             causal=causal,
             sliding_window_size=sliding_window_size,
+            device=q.device,
         )
 
         if envs.SGLANG_TPU_USE_FLASH_ATTN.get() and self._attend_flash(
-            q=q, k=k, v=v, out=out, scaling=scaling, cpu_mask=cpu_mask
+            q=q, k=k, v=v, out=out, scaling=scaling, cpu_mask=mask
         ):
             return
-
-        mask = cpu_mask.to(q.device) if cpu_mask is not None else None
 
         for h in range(num_q_heads):
             kv_h = h // group_size
@@ -915,19 +869,14 @@ class TpuAttnBackend(TorchNativeAttnBackend):
 
         for b, plan in enumerate(plans):
             # Slice this request's real rows: [H_q, q_len, D] from the padded
-            # [B, H_q, q_pad, D] result.  ``out`` may be on the TPU device
-            # (call_device path, fp16) or on the host (legacy fallback);
+            # [B, H_q, q_pad, D] result. Both are device tensors;
             # ``_device_cast`` handles the fp16->bf16 hop the device cannot do
-            # directly, and the .to(device) normalises the host case.
-            seg = out[b, :, : plan.q_len, :]
-            if seg.device.type == "tpu":
-                seg = _device_cast(seg, output.dtype)
-            else:
-                seg = seg.to(output.dtype)
+            # directly.
+            seg = _device_cast(out[b, :, : plan.q_len, :], output.dtype)
             self._scatter_plan_output(
                 output=output,
                 plan=plan,
-                per_req_out=seg.to(output.device),
+                per_req_out=seg,
             )
         return True
 

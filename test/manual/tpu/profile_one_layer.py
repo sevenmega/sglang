@@ -15,6 +15,7 @@ Run:
 
 from __future__ import annotations
 
+import os
 import argparse
 import statistics
 import sys
@@ -122,18 +123,25 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
     # Attention. The kernel runs one launch per bucketed request set with a
     # block-diagonal mask, so a query attends ONLY its own request's keys --
     # NOT all T. Batch B requests x S tokens each => B * S^2 score pairs,
-    # i.e. T*S with T = B*S, not T*T. Padded to block_M/block_N multiples.
+    # i.e. T*S with T = B*S, not T*T. Padded to the kernel's tile multiples.
+    from sglang.srt.hardware_backend.tpu.attention import _flash_pad_lens
+
     B_req = forward_batch.batch_size
-    S = ceildiv(T // B_req, 8) * 8          # block_M padding
-    S_kv = ceildiv(S, 128) * 128            # block_N padding, floored at S
+    per_req = ceildiv(T, B_req)
+    # Single source of truth for the tiles: these must match the kernel's
+    # block_M/block_N, and hardcoding them here is how they went stale before.
+    S, S_kv = _flash_pad_lens(per_req, per_req)
     attn_macs = B_req * S * S_kv * Hq * D * 2  # QK^T then P@V
     attn_bytes = (
-        B_req * S * q_dim           # q (padded)
-        + 2 * B_req * S_kv * kv_dim  # k, v (padded)
-        + B_req * S * S_kv           # mask build + mask read
-        + B_req * S * q_dim          # out
-        + 2 * B_req * S_kv * kv_dim  # kv cache write
-    ) * bpe
+        (
+            B_req * S * q_dim           # q (padded)
+            + 2 * B_req * S_kv * kv_dim  # k, v (padded)
+            + B_req * S * q_dim          # out
+            + 2 * B_req * S_kv * kv_dim  # kv cache write
+        )
+        * bpe
+        + B_req * S * S_kv * 4  # additive mask is fp32, not bpe-sized
+    )
     print(
         f"[prof] attn accounting: B_req={B_req} S={S} S_kv={S_kv} "
         f"Hq={Hq} D={D} -> {attn_macs/1e6:.1f} MMAC "
@@ -213,7 +221,11 @@ def main():
     ap.add_argument("--model-path", default="/workspace/Qwen3-0.6B")
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--input-len", type=int, default=256)
-    ap.add_argument("--device-id", type=int, default=6)
+    ap.add_argument(
+        "--device-id",
+        type=int,
+        default=int(os.environ.get("SGLANG_TPU_DEVICE_ID", "0")),
+    )
     args = ap.parse_args()
     DEV = str(args.device_id)
 

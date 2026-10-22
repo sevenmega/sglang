@@ -47,57 +47,34 @@ _MASK_NEG = -30000.0
 _FLASH_KERNELS: dict[tuple, object] = {}
 
 
-def _causal_mask(b, sq, skv):
+def _causal_mask(b, sq, skv, device):
     """Additive [b, sq, skv] fp32 causal mask, clamped fp16-safe."""
-    i = torch.arange(sq).unsqueeze(1)
-    j = torch.arange(skv).unsqueeze(0)
+    i = torch.arange(sq, device=device).unsqueeze(1)
+    j = torch.arange(skv, device=device).unsqueeze(0)
     disallowed = j > (i + (skv - sq))
-    mask = torch.zeros(b, sq, skv, dtype=torch.float32)
+    mask = torch.zeros(b, sq, skv, dtype=torch.float32, device=device)
     mask.masked_fill_(disallowed.unsqueeze(0), _MASK_NEG)
     return mask
 
 
-def _get_flash_kernel(b, qm, kvm, d, q_head, kv_head, scaling):
-    # Shape-generic kernel: only (d, scaling) are compile-time, so key on those.
-    key = (d, float(scaling))
+def _dtype_name(dt):
+    # str(torch.bfloat16) is "torch.bfloat16"; T.dtype wants "bfloat16".
+    return str(dt).replace("torch.", "")
+
+
+def _get_flash_kernel(d, scaling, dtype):
+    # Shape-generic kernel: (d, scaling, dtype) are the compile-time params, so
+    # key on those; B/Hq/Sq/Hkv/Skv resolve per launch.
+    key = (d, float(scaling), _dtype_name(dtype))
     kern = _FLASH_KERNELS.get(key)
     if kern is None:
         from tilelang.tpu.kernels.attention import flash_attention_gqa
 
-        # Lazy factory call (dynamic B/Hq/Sq/Hkv/Skv resolved per launch).
-        kern = flash_attention_gqa(d=d, sm_scale=float(scaling))
+        kern = flash_attention_gqa(
+            d=d, sm_scale=float(scaling), dtype=_dtype_name(dtype)
+        )
         _FLASH_KERNELS[key] = kern
     return kern
-
-
-# The PPL wrapper binds its stream/device once, at kernel build, from
-# TPU_VISIBLE_DEVICES; the torch_tpu runtime keeps a separate "current device"
-# that drifts to a stale index after any device-tensor alloc or copy. The next
-# PPL launch then dies with "stream and device mismatch!". Re-assert the device
-# through the runtime's own API before each launch.
-_TPURT_SET_DEVICE = None
-
-
-def _sync_rt_device():
-    global _TPURT_SET_DEVICE
-    if _TPURT_SET_DEVICE is None:
-        try:
-            import ctypes
-
-            # Already mapped by torch_tpu; opening the .so by path would pull in
-            # libbmlib.so.0, which is not on the loader path.
-            lib = ctypes.CDLL(None, mode=ctypes.RTLD_GLOBAL)
-            fn = lib.tpuRtSetDevice
-            fn.argtypes = [ctypes.c_int]
-            fn.restype = ctypes.c_int
-            _TPURT_SET_DEVICE = fn
-        except Exception as exc:  # noqa: BLE001
-            print(f"[TPU] cannot re-assert runtime device: {exc!r}", flush=True)
-            _TPURT_SET_DEVICE = False
-            return
-    if _TPURT_SET_DEVICE is False:
-        return
-    _TPURT_SET_DEVICE(DEV_ID)
 
 
 # ---------------------------------------------------------------------------
@@ -124,37 +101,38 @@ def tpu_perhead_attention(
     kv_pad = -(-Skv // block_n) * block_n
     kv_pad = max(kv_pad, q_pad)
 
-    # HF hands us head-major fp16 tensors already ([B, H, S, D]); pad them up to
-    # the kernel tiles on the host. The bf16->fp16 cast happens on the host: the
-    # device only supports same-dtype copies, and the kernel marshals its
-    # arguments through CPU memory anyway.
-    q = torch.zeros(B, Hq, q_pad, D, dtype=torch.float16)
-    q[:, :, :Sq] = query.detach().cpu().half()
-    k = torch.zeros(B, Hkv, kv_pad, D, dtype=torch.float16)
-    k[:, :, :Skv] = key.detach().cpu().half()
-    v = torch.zeros(B, Hkv, kv_pad, D, dtype=torch.float16)
-    v[:, :, :Skv] = value.detach().cpu().half()
+    # Device tensors throughout: the kernel launches with device pointers, so
+    # the padding and the mask are built where the data already lives. Nothing
+    # is marshalled through CPU memory, and the dtype stays whatever HF gave us
+    # (the kernel compiles for it directly).
+    q = torch.zeros(B, Hq, q_pad, D, dtype=orig_dtype, device=orig_device)
+    q[:, :, :Sq] = query.detach()
+    k = torch.zeros(B, Hkv, kv_pad, D, dtype=orig_dtype, device=orig_device)
+    k[:, :, :Skv] = key.detach()
+    v = torch.zeros(B, Hkv, kv_pad, D, dtype=orig_dtype, device=orig_device)
+    v[:, :, :Skv] = value.detach()
 
     # Additive mask [B,1,Sq,Skv] -> padded [B,q_pad,kv_pad] fp32, fp16-safe.
     if attention_mask is not None:
-        m = attention_mask[:, :1, :, :Skv].float().cpu()  # [B,1,Sq,Skv]
+        m = attention_mask[:, :1, :, :Skv].float().to(orig_device)  # [B,1,Sq,Skv]
         m = m.squeeze(1).clamp_min(_MASK_NEG)  # [B,Sq,Skv]
     else:  # causal fallback
-        m = _causal_mask(B, Sq, Skv)  # [B,Sq,Skv]
+        m = _causal_mask(B, Sq, Skv, orig_device)  # [B,Sq,Skv]
 
     if q_pad != Sq or kv_pad != Skv:
         # Mask row r <-> query row r, column j <-> key j (the kernel bakes in no
         # causal constraint). Padded key columns are -30000 so no real query
         # attends a padded key; padded query rows are 0 because the kernel
         # softmaxes over a whole query tile.
-        padded = torch.full((B, q_pad, kv_pad), _MASK_NEG, dtype=torch.float32)
+        padded = torch.full(
+            (B, q_pad, kv_pad), _MASK_NEG, dtype=torch.float32, device=orig_device
+        )
         padded[:, :Sq, :Skv] = m
         padded[:, Sq:, :] = 0.0
         m = padded
 
-    kernel = _get_flash_kernel(B, q_pad, kv_pad, D, Hq, Hkv, scaling)
-    _sync_rt_device()
-    out = kernel(q, k, v, m)  # [B,Hq,q_pad,D] fp16
+    kernel = _get_flash_kernel(D, scaling, orig_dtype)
+    out = kernel(q, k, v, m)  # [B,Hq,q_pad,D], on device
     out = out[:, :, :Sq]  # [B,Hq,Sq,D]
 
     # HF's eager attention returns [B, Sq, Hq, D]; the caller reshapes to

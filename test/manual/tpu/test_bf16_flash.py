@@ -54,16 +54,22 @@ def ref_attention(q, k, v, mask, scale):
 
 
 def run_case(label, dtype, B, SQ, SKV, HQ, HKV):
+    # Device tensors only: the kernel launches with device pointers.
+    from tilelang.tpu.ppl_runner import ensure_tpu_device
+
+    dev = f"tpu:{ensure_tpu_device()}"
     kernel = flash_attention_gqa(d=D, sm_scale=SCALE, dtype=dtype_str(dtype))
     torch.manual_seed(0)
-    q = torch.randn(B, HQ, SQ, D, dtype=dtype)
-    k = torch.randn(B, HKV, SKV, D, dtype=dtype)
-    v = torch.randn(B, HKV, SKV, D, dtype=dtype)
+    q = torch.randn(B, HQ, SQ, D, dtype=dtype, device=dev)
+    k = torch.randn(B, HKV, SKV, D, dtype=dtype, device=dev)
+    v = torch.randn(B, HKV, SKV, D, dtype=dtype, device=dev)
     mask2d = build_causal_mask(SQ, SKV)
-    mask = mask2d.unsqueeze(0).expand(B, SQ, SKV).contiguous()
+    mask = mask2d.unsqueeze(0).expand(B, SQ, SKV).contiguous().to(dev)
 
-    out = kernel(q, k, v, mask).float()
-    ref = ref_attention(q, k, v, mask, SCALE)
+    # Kernel returns a device tensor; the torch reference is a CPU computation
+    # (on-device matmul is not a valid oracle), so compare on host.
+    out = kernel(q, k, v, mask).float().cpu()
+    ref = ref_attention(q.cpu(), k.cpu(), v.cpu(), mask.cpu(), SCALE)
 
     diff = (out - ref).abs()
     rel = (diff.norm() / ref.norm().clamp_min(1e-6)).item()

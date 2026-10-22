@@ -2,10 +2,18 @@
 
 Times each phase of the batched flash-attention driver separately:
   gather  -- slicing q/k/v out of the packed query + paged KV cache
-  pack    -- host zero-pad into [B,H,S_pad,D] fp16
-  mask    -- building the [B,q_pad,kv_pad] additive mask
-  launch  -- the PPL kernel call (includes _sync_rt_device)
+  pack    -- zero-padding per request into [B,H,s_pad,D], on-device
+  mask    -- building the [B,q_pad,kv_pad] additive mask, on-device
+  launch  -- the PPL kernel call (device pointers). Synchronous: the launch
+             call itself blocks on py_sync_device, so this phase includes the
+             whole kernel execution, not just dispatch.
   scatter -- slicing the output back into [T,H,D]
+
+Each phase is bracketed by a device sync inside ``timed``, so the numbers are
+serialized costs and their sum overstates a pipelined run.
+
+The device comes from ``--device-id`` (default: SGLANG_TPU_DEVICE_ID, else 0).
+torch_tpu ignores TPU_VISIBLE_DEVICES, so that env var alone will not move it.
 
 Run:
     SGLANG_TPU_DEVICE_ID=6 python3 profile_attn_phases.py --batch-size 32 --input-len 256
@@ -13,6 +21,7 @@ Run:
 
 from __future__ import annotations
 
+import os
 import argparse
 import statistics
 import sys
@@ -33,7 +42,11 @@ def main():
     ap.add_argument("--model-path", default="/workspace/Qwen3-0.6B")
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--input-len", type=int, default=256)
-    ap.add_argument("--device-id", type=int, default=6)
+    ap.add_argument(
+        "--device-id",
+        type=int,
+        default=int(os.environ.get("SGLANG_TPU_DEVICE_ID", "0")),
+    )
     args = ap.parse_args()
     DEV = str(args.device_id)
 
