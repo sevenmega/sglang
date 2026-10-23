@@ -47,6 +47,8 @@ def main():
         type=int,
         default=int(os.environ.get("SGLANG_TPU_DEVICE_ID", "0")),
     )
+    ap.add_argument("--profile", action="store_true", help="Enable hardware profiling")
+    ap.add_argument("--verbose", action="store_true", help="Verbose profiling output")
     args = ap.parse_args()
     DEV = str(args.device_id)
 
@@ -189,6 +191,17 @@ def main():
         run_attn()
     SYNC()
 
+    # Arm profiling after warmup, once the kernel is cached. Reach into
+    # the flash kernel cache (populated by the warmup) and enable_profile
+    # on the single cached kernel for this (d, scale, dtype) key.
+    if args.profile:
+        from sglang.srt.hardware_backend.tpu.attention import _FLASH_KERNELS
+        if _FLASH_KERNELS:
+            # There is exactly one kernel cached (d=128, scale=D**-0.5, dtype from the model).
+            cached_kernel = next(iter(_FLASH_KERNELS.values()))
+            cached_kernel.adapter.enable_profile()
+            print(f"[ph] profiling armed for {list(_FLASH_KERNELS.keys())[0]}", flush=True)
+
     totals = []
     for _ in range(ROUNDS):
         SYNC()
@@ -196,6 +209,11 @@ def main():
         run_attn()
         SYNC()
         totals.append(time.perf_counter() - t0)
+
+    if args.profile:
+        print(f"\n[ph] collecting profile...", flush=True)
+        cached_kernel.adapter.collect_profile(verbose=args.verbose)
+
 
     total = statistics.median(totals)
     print(f"\n[ph] attn op total: {total*1e6:.0f} us  (median of {ROUNDS})")
