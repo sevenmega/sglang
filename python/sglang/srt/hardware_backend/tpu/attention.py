@@ -142,6 +142,11 @@ def _pack_flash_batch_device(
 # request; building invokes ppl-compile (seconds), so it runs at most once.
 _FLASH_KERNELS: dict[tuple, object] = {}
 
+# Same idea for the paged/varlen kernel, which carries its own cache key: it
+# reads the KV cache in place, so the kernel's element type must equal the
+# cache's and its own arg list differs from the gathered kernel's.
+_PAGED_FLASH_KERNELS: dict[tuple, object] = {}
+
 # --- TEMP instrumentation: flash-attention call shapes --------------------
 # Set SGLANG_TPU_LOG_FLASH_SHAPES=1 to log every launch (shape + batch size) and,
 # at process exit, the deduplicated shape union plus the total launch count. The
@@ -228,12 +233,27 @@ class _AttnReqPlan(msgspec.Struct, frozen=True):
     req_pool_idx: int  # row of ``req_to_token`` holding its token indices
 
 
+def _as_int_list(x) -> Optional[list[int]]:
+    """Materialize a device tensor's values on the host in ONE transfer.
+
+    ``int(t[i])`` in a loop is a scalar device->host read *per element*, and
+    each one synchronizes the device.  On a 32-request prefill that was 64
+    separate round trips (~5.5 ms measured) just to learn lengths the host
+    already knew.  ``tolist()`` copies the whole vector once.
+    """
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return x.tolist()
+    return list(x)
+
+
 def _plan_attention_requests(
     *,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
+    req_pool_indices,
+    seq_lens,
     q_lens: list[int],
-    encoder_lens: Optional[torch.Tensor],
+    encoder_lens,
     is_cross_attn: bool,
 ) -> list[_AttnReqPlan]:
     """Resolve each request's query rows and KV extent.
@@ -242,18 +262,22 @@ def _plan_attention_requests(
     window is the request's encoder slice for cross-attention, the sequence
     cached after the encoder prefix otherwise, and the plain sequence with no
     encoder.
+
+    ``req_pool_indices`` / ``seq_lens`` / ``encoder_lens`` must already be host
+    sequences (see :func:`_as_int_list`) -- reading them element-wise off a
+    device tensor would sync once per element.
     """
     plans = []
     q_start = 0
     for seq_idx in range(len(q_lens)):
         q_len = q_lens[seq_idx]
-        seq_len_kv = int(seq_lens[seq_idx])
+        seq_len_kv = seq_lens[seq_idx]
         if encoder_lens is not None:
             if is_cross_attn:
                 kv_start = 0
-                kv_len = int(encoder_lens[seq_idx])
+                kv_len = encoder_lens[seq_idx]
             else:
-                kv_start = int(encoder_lens[seq_idx])
+                kv_start = encoder_lens[seq_idx]
                 kv_len = seq_len_kv
         else:
             kv_start = 0
@@ -264,7 +288,7 @@ def _plan_attention_requests(
                 q_len=q_len,
                 kv_start=kv_start,
                 kv_len=kv_len,
-                req_pool_idx=int(req_pool_indices[seq_idx]),
+                req_pool_idx=req_pool_indices[seq_idx],
             )
         )
         q_start += q_len
@@ -358,6 +382,52 @@ def _get_flash_kernel(
             )
             _FLASH_DISABLED = True
             return None
+    return kern
+
+
+def _get_paged_flash_kernel(
+    *, d: int, scaling: float, dtype: torch.dtype = torch.float16
+):
+    """Return a cached paged/varlen flash kernel, or None if unavailable.
+
+    The kernel gathers its own K/V rows out of the KV cache and takes the packed
+    ``[T, H_q, D]`` queries as they are, so the driver no longer materializes
+    per-request ``[H, S_pad, D]`` copies of q/k/v: the only per-request work left
+    is building the token index and copying each request's real output rows out
+    of the padded per-request slabs.
+
+    ``d``, ``scaling`` and ``dtype`` are the compile-time parameters (``dtype``
+    sizes the global buffers, so it must equal the KV cache's element type);
+    batch/seq lengths are dynamic. See
+    ``tilelang.tpu.kernels.attention_paged.flash_attention_paged``.
+    """
+    block_m, block_n = _FLASH_BLOCK_M, _FLASH_BLOCK_N
+    key = (d, float(scaling), _dtype_name(dtype), block_m, block_n)
+    kern = _PAGED_FLASH_KERNELS.get(key)
+    if kern is not None:
+        return kern
+    try:
+        import sys
+
+        if "/workspace/tilelang" not in sys.path:
+            sys.path.insert(0, "/workspace/tilelang")
+        from tilelang.tpu.kernels.attention_paged import flash_attention_paged
+
+        kern = flash_attention_paged(
+            d=d,
+            block_M=block_m,
+            block_N=block_n,
+            sm_scale=float(scaling),
+            dtype=_dtype_name(dtype),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[TPU] paged flash-attention kernel unavailable (%s); "
+            "falling back to the gathered batch path.",
+            exc,
+        )
+        return None
+    _PAGED_FLASH_KERNELS[key] = kern
     return kern
 
 
@@ -889,6 +959,144 @@ class TpuAttnBackend(TorchNativeAttnBackend):
             )
         return True
 
+    @staticmethod
+    def _build_paged_token_index(
+        *,
+        plans: list[_AttnReqPlan],
+        req_to_token: torch.Tensor,
+        n_kv_heads: int,
+        kv_pad: int,
+    ) -> torch.Tensor:
+        """Build the paged kernel's ``Idx[B, H_kv, kv_pad]`` row index.
+
+        Entry ``(b, h, j)`` is the flat row of the ``[rows * H_kv, D]`` view of
+        the KV cache to gather for request ``b``'s ``j``-th key under kv head
+        ``h``, i.e. ``slot * H_kv + h`` -- the cache itself is NHD, so its rows
+        for one key are adjacent and one gather fetches all heads at once.
+
+        Padded columns (``j >= kv_len``) stay at slot 0, which is a *valid* row:
+        the additive mask discards them, and an out-of-range index would fault
+        the SDMA gather instead of contributing nothing.
+        """
+        device = req_to_token.device
+        slots = torch.zeros((len(plans), kv_pad), dtype=torch.int32, device=device)
+        for b, plan in enumerate(plans):
+            slots[b, : plan.kv_len] = req_to_token[
+                plan.req_pool_idx, plan.kv_start : plan.kv_start + plan.kv_len
+            ]
+        heads = torch.arange(n_kv_heads, dtype=torch.int32, device=device)
+        # [B, 1, kv_pad] * H_kv + [1, H_kv, 1] -> [B, H_kv, kv_pad]
+        idx = slots.unsqueeze(1) * n_kv_heads + heads.view(1, -1, 1)
+        return idx.contiguous()
+
+    def _attend_plan_bucket_paged(
+        self,
+        *,
+        plans: list[_AttnReqPlan],
+        query: torch.Tensor,  # [H_q, num_tokens, D]
+        output: torch.Tensor,  # [num_tokens, H_q, D]
+        k_cache: torch.Tensor,  # [rows, H_kv, D] (NHD, unchanged)
+        v_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+        scaling: float,
+        causal: bool,
+        sliding_window_size: Optional[int],
+    ) -> bool:
+        """One paged/varlen launch for ``plans``; False if the path cannot be used.
+
+        The kernel reads K/V straight out of the cache at ``Idx``'s rows and
+        takes the packed queries as they lie, so the driver's per-request gather,
+        pack and scatter collapse into a token index plus one copy of each
+        request's real output rows. Returns False -- leaving ``output``
+        untouched -- whenever the layout is not one the kernel can consume, so
+        the caller can use the gathered batch path instead.
+        """
+        # The kernel addresses [T, H_q, D] by a per-request row offset, which is
+        # exactly the model's packed query layout: recover it as a view of the
+        # [H_q, T, D] tensor this driver carries. A copy here would cost as much
+        # as the packing this path is meant to remove, so bail out instead.
+        q_packed = query.movedim(0, 1)  # [T, H_q, D]
+        if not (q_packed.is_contiguous() and output.is_contiguous()):
+            return False
+        if not (k_cache.is_contiguous() and v_cache.is_contiguous()):
+            return False
+        act_dtype = _flash_dtype_of(query)
+        if k_cache.dtype != act_dtype or v_cache.dtype != act_dtype:
+            return False
+
+        q_lens = [p.q_len for p in plans]
+        kv_lens = [p.kv_len for p in plans]
+        # Every plan in the bucket shares a padded shape by construction.
+        q_pad, kv_pad = _flash_pad_lens(q_lens[0], kv_lens[0])
+        d = query.shape[-1]
+        kernel = _get_paged_flash_kernel(d=d, scaling=scaling, dtype=act_dtype)
+        if kernel is None:
+            return False
+        for plan in plans:
+            _record_flash_shape(
+                hq=query.shape[0], hkv=k_cache.shape[1],
+                q_len=plan.q_len, kv_len=plan.kv_len,
+                q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling,
+            )
+        # The kernel reads each request's query tile at its true row offset
+        # ``q_start + tq*block_M`` with no clamp, so the trailing tile of the
+        # last request over-reads by up to ``block_M - 1`` rows past the packed
+        # buffer. Pad the buffer so that read stays in bounds (the extra rows
+        # feed only discarded output). ``max(q_start) + q_pad`` is the exact
+        # upper bound of any read; a short decode batch (fewer rows than one
+        # tile) is the common case that needs it.
+        max_read = max(plan.q_start for plan in plans) + q_pad
+        if q_packed.shape[0] < max_read:
+            padded = torch.zeros(
+                (max_read, *q_packed.shape[1:]),
+                dtype=q_packed.dtype,
+                device=q_packed.device,
+            )
+            padded[: q_packed.shape[0]] = q_packed
+            q_packed = padded
+
+        try:
+            idx = self._build_paged_token_index(
+                plans=plans,
+                req_to_token=req_to_token,
+                n_kv_heads=k_cache.shape[1],
+                kv_pad=kv_pad,
+            )
+            q_off = torch.tensor(
+                [plan.q_start for plan in plans],
+                dtype=torch.int32,
+                device=q_packed.device,
+            )
+            mask = self._build_batched_additive_mask(
+                q_lens=q_lens,
+                kv_lens=kv_lens,
+                q_pad=q_pad,
+                kv_pad=kv_pad,
+                causal=causal,
+                sliding_window_size=sliding_window_size,
+                device=q_packed.device,
+            ).contiguous()  # [B, q_pad, kv_pad] fp32, on device
+
+            out = kernel(q_packed, k_cache, v_cache, idx, mask, q_off)
+            _record_flash_launch(
+                batch=len(plans), q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[TPU] paged flash-attention launch failed (%s); "
+                "falling back to the gathered batch path for all %d requests.",
+                exc,
+                len(plans),
+            )
+            return False
+
+        # [B, q_pad, H_q, D] -> the packed [T, H_q, D] output, real rows only.
+        for b, plan in enumerate(plans):
+            output[plan.q_start : plan.q_start + plan.q_len] = _device_cast(
+                out[b, : plan.q_len], output.dtype
+            )
+        return True
+
     def _run_sdpa_batched_attention(
         self,
         *,
@@ -910,11 +1118,14 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
+        # One host transfer each, not one per element: the planner only needs
+        # these as plain ints, and indexing a device tensor element-wise costs
+        # a device sync per request.
         plans = _plan_attention_requests(
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
+            req_pool_indices=_as_int_list(req_pool_indices),
+            seq_lens=_as_int_list(seq_lens),
             q_lens=q_lens,
-            encoder_lens=encoder_lens,
+            encoder_lens=_as_int_list(encoder_lens),
             is_cross_attn=is_cross_attn,
         )
 
@@ -939,9 +1150,24 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         buckets = _bucket_attention_plans(
             plans, n_q_heads=query.shape[0], n_kv_heads=k_cache.shape[1]
         )
+        use_paged = envs.SGLANG_TPU_USE_PAGED_FLASH_ATTN.get()
         for bucket in buckets:
             for start in range(0, len(bucket), _FLASH_MAX_BATCH):
                 chunk = bucket[start : start + _FLASH_MAX_BATCH]
+                # The paged kernel needs no per-request copies, so it is worth a
+                # launch even for a lone request; the gathered path is not.
+                if use_paged and self._attend_plan_bucket_paged(
+                    plans=chunk,
+                    query=query,
+                    output=output,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    req_to_token=req_to_token,
+                    scaling=scaling,
+                    causal=causal,
+                    sliding_window_size=sliding_window_size,
+                ):
+                    continue
                 # A lone request has nothing to batch -- skip straight to the
                 # path that already handles every shape.
                 if len(chunk) == 1:
@@ -990,7 +1216,7 @@ class TpuAttnBackend(TorchNativeAttnBackend):
             req_to_token=req_to_token,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            q_lens=[int(x) for x in extend_seq_lens],
+            q_lens=_as_int_list(extend_seq_lens),
             encoder_lens=encoder_lens,
             scaling=scaling,
             causal=causal,

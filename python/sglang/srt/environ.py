@@ -455,6 +455,18 @@ class Envs:
     # to launch -- still run through the per-request path, so this is a pure
     # launch-count reduction with the same fallback contract.
     SGLANG_TPU_USE_BATCHED_FLASH_ATTN = EnvBool(True)
+    # Give each batched flash-attention launch the paged KV cache and the token
+    # index directly instead of a per-request gathered copy of it, and take the
+    # packed queries as they are instead of re-packing them. Removes the driver's
+    # gather/pack/scatter around the kernel; falls back to the gathered path when
+    # the cache layout is incompatible.
+    #
+    # ON by default: it measures faster than the gathered path on the prefill
+    # buckets it was tuned on. The driver no longer materializes [B,H,s_pad,D]
+    # q/k/v copies or a scattered output, and the kernel reads K/V in place out
+    # of the cache. The gathered path is kept as the fallback (and for A/B) --
+    # set this to 0 to force it; ``profile_attn_phases.py --raw`` compares them.
+    SGLANG_TPU_USE_PAGED_FLASH_ATTN = EnvBool(True)
     # Log every flash-attention launch (shape + batch size) to stderr, and the
     # deduplicated union plus launch count at process exit. TEMP diagnostic.
     SGLANG_TPU_LOG_FLASH_SHAPES = EnvBool(False)
