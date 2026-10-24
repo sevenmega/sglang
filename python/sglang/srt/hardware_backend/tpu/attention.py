@@ -398,9 +398,18 @@ class TpuAttnBackend(TorchNativeAttnBackend):
             return None
 
         query_offset = kv_len - q_len
-        # [q_len, 1] + int -> broadcast positions; [1, kv_len] for keys.
+        # [q_len, 1] query positions, [1, kv_len] key indices, both expanded to
+        # the full [q_len, kv_len] grid *before* comparing.
+        #
+        # The explicit ``expand`` is load-bearing: this torch_tpu build swaps the
+        # operands of a *broadcasting* comparison, so ``j > pos`` with a [q,1]
+        # and a [1,kv] operand evaluates as ``pos > j`` and the causal mask comes
+        # out transposed (and, when q_len != kv_len, as unrelated garbage).
+        # ``+``/``*`` broadcast correctly; only comparisons are affected.
+        # Comparing two equal-shaped tensors takes the correct path.
         pos = torch.arange(q_len, device=device).unsqueeze(1) + query_offset
-        j = torch.arange(kv_len, device=device).unsqueeze(0)
+        pos = pos.expand(q_len, kv_len)
+        j = torch.arange(kv_len, device=device).unsqueeze(0).expand(q_len, kv_len)
 
         disallowed = torch.zeros(q_len, kv_len, dtype=torch.bool, device=device)
         if causal:
