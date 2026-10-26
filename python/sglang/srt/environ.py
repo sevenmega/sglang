@@ -467,6 +467,17 @@ class Envs:
     # of the cache. The gathered path is kept as the fallback (and for A/B) --
     # set this to 0 to force it; ``profile_attn_phases.py --raw`` compares them.
     SGLANG_TPU_USE_PAGED_FLASH_ATTN = EnvBool(True)
+    # Fuse qkv_proj -> qk-norm -> RoPE -> KV-cache write into one tilelang/PPL
+    # kernel per decoder layer, replacing the ~15 launches the torch chain costs
+    # (linear, split views, two RMSNorms, cos/sin index_select + chunk/mul/add/
+    # cat, two cache scatters). The kernel writes K/V straight into the paged
+    # cache, so the attention backend must be handed ``save_kv_cache=False``.
+    #
+    # OFF by default: it needs a per-shape kernel build (~1 min) at first use,
+    # and its arithmetic normalizes the fp32 projection where the torch path
+    # normalizes a bf16-rounded one, so greedy outputs can differ on near-ties.
+    # Only the Qwen3 TPU path is wired; anything else ignores it.
+    SGLANG_TPU_USE_FUSED_QKV_ROPE = EnvBool(False)
     # Log every flash-attention launch (shape + batch size) to stderr, and the
     # deduplicated union plus launch count at process exit. TEMP diagnostic.
     SGLANG_TPU_LOG_FLASH_SHAPES = EnvBool(False)

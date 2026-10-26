@@ -8,6 +8,7 @@ from torch import nn
 from sglang.srt.distributed import (
     get_pp_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -34,7 +35,7 @@ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu, is_tpu
 
 Qwen3Config = None
 
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 _has_fused_qk_norm_mrope = False
@@ -58,6 +60,12 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
+
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.fused_qkv_rope import (
+        TpuFusedQkvRope,
+        kernel_geometry_ok,
+    )
 
 
 class Qwen3Attention(nn.Module):
@@ -168,6 +176,90 @@ class Qwen3Attention(nn.Module):
             # a `with torch.device('cuda'):` context that changes the default device.
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
+
+        self._tpu_fused_qkv_rope = self._build_tpu_fused_qkv_rope()
+
+    def _build_tpu_fused_qkv_rope(self):
+        """The TPU fused qkv/norm/RoPE/cache-write op, or None to keep torch.
+
+        Decided once, here, because every condition is a property of the layer's
+        geometry: the kernel bakes the head layout and its own query-row tile, so
+        a layer that does not match exactly must not reach it.  The per-forward
+        checks (dtype, cross attention, sliding window) live at the call site.
+        """
+        if not (_is_tpu and envs.SGLANG_TPU_USE_FUSED_QKV_ROPE.get()):
+            return None
+        if isinstance(self.rotary_emb, MRotaryEmbedding):
+            return None
+        if not self.rotary_emb.is_neox_style:
+            return None
+        if self.rotary_emb.rotary_dim != self.head_dim:
+            return None
+        if not kernel_geometry_ok(
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+        ):
+            logger.warning(
+                "TPU fused qkv/rope disabled for layer %s: head geometry "
+                "(H=%d, Hq=%d, Hkv=%d, D=%d) is outside the kernel's contract",
+                self.attn.layer_id,
+                self.hidden_size,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+            return None
+        return TpuFusedQkvRope(
+            qkv_proj=self.qkv_proj,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+        )
+
+    def _tpu_fused_ok(self, hidden_states, forward_batch) -> bool:
+        """Per-forward gate: the layout the kernel consumes, nothing else."""
+        return (
+            self._tpu_fused_qkv_rope is not None
+            and hidden_states.dtype == torch.bfloat16
+            and not self.attn.is_cross_attention
+            and self.attn.sliding_window_size < 0
+            and forward_batch.out_cache_loc is not None
+            and get_exec().deterministic.rl_on_policy_target is None
+        )
+
+    def forward_prepare_tpu(self, positions, hidden_states, forward_batch):
+        """Fused qkv_proj + qk-norm + RoPE + paged-cache write.
+
+        K/V are in the cache when this returns, so the attention backend must not
+        write them again: the caller passes save_kv_cache=False and (q, None,
+        None), exactly like the aiter fused-mRoPE path.
+        """
+        # The torch RoPE path co-locates the cache on first use; bypassing it
+        # leaves cos_sin_cache on its init device (CPU).  Same call, same
+        # effect: move it to the activation's device and dtype.
+        logger.info_once(
+            "TPU fused qkv/rope engaged: hidden=%d, heads=%d/%d, head_dim=%d",
+            hidden_states.shape[1],
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+        )
+        self.rotary_emb._match_cos_sin_cache_dtype(hidden_states)
+        k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.attn.layer_id)
+        q = self._tpu_fused_qkv_rope(
+            hidden_states=hidden_states,
+            positions=positions,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            out_cache_loc=forward_batch.out_cache_loc,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            eps=self.q_norm.variance_epsilon,
+        )
+        return q, None, None
 
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -281,7 +373,12 @@ class Qwen3Attention(nn.Module):
             and get_exec().deterministic.rl_on_policy_target is None
         )
 
-        if use_aiter_fused:
+        if self._tpu_fused_ok(hidden_states, forward_batch):
+            q, k, v = self.forward_prepare_tpu(
+                positions, hidden_states, forward_batch
+            )
+            save_kv_cache = False
+        elif use_aiter_fused:
             q, k, v = self.forward_prepare_aiter_fused_mrope(
                 positions, hidden_states, forward_batch
             )
