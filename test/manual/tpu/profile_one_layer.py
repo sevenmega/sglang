@@ -9,8 +9,15 @@ are wall-clock *serialized* costs -- they sum to more than the unsynced layer
 time whenever the runtime overlaps work. Both are reported so the gap (the
 overlap) is visible rather than hidden.
 
+``SGLANG_TPU_USE_FUSED_QKV_ROPE=1`` measures the fused qkv_proj + qk-norm +
+RoPE + paged-cache-write kernel in place of the ``qkv_proj`` row, and drops the
+separate attention KV write (the fused kernel already did it). The gate is the
+same one the model uses (``Qwen3Attention._tpu_fused_ok``), so a layer/device
+the kernel cannot serve silently keeps the torch rows.
+
 Run:
     SGLANG_TPU_DEVICE_ID=5 python3 profile_one_layer.py --batch-size 32 --input-len 256
+    SGLANG_TPU_USE_FUSED_QKV_ROPE=1 python3 profile_one_layer.py
 """
 
 from __future__ import annotations
@@ -166,16 +173,57 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
     norm_bytes = 2 * T * H * 4  # fp32 stats traffic dominates a norm
 
     # --- callables ----------------------------------------------------------
-    def run_qkv():
-        return attn.qkv_proj(hidden_states)
+    def run_norm():
+        return norm(hidden_states)
 
-    qkv, _ = run_qkv()
-    q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+    # The fused kernel takes the *post*-input_layernorm hidden (folding the LN
+    # in is the deferred milestone), so it gets the same tensor this row times.
+    normed = run_norm()
+    fused = attn._tpu_fused_ok(normed, forward_batch)
+    if fused:
+        print(
+            "[prof] SGLANG_TPU_USE_FUSED_QKV_ROPE=1 -> qkv_proj is measured as "
+            "the fused qk-norm+RoPE+KV-cache-write kernel (the e2e warmup above "
+            "already paid its compile)",
+            flush=True,
+        )
+
+    # qk-norm (sum of squares, then scale) and RoPE (3 mul-adds per rotated
+    # element) run over q and k only, so they ride on top of the GEMM macs.
+    fused_macs = qkv_macs + 5 * T * (q_dim + kv_dim)
+    fused_bytes = (
+        (
+            H * (q_dim + 2 * kv_dim)  # qkv weight
+            + T * H  # X
+            + T * q_dim  # Q out
+            + T * D  # cos|sin rows for this batch
+            + 2 * T * kv_dim  # k/v scattered into the cache
+        )
+        * bpe
+        + 2 * Hkv * T * 4  # kv_row table is uint32
+    )
+
+    def run_fused_qkv():
+        from sglang.srt.model_executor.forward_context import forward_context
+        with forward_context(ctx):
+            q, _, _ = attn.forward_prepare_tpu(positions, normed, forward_batch)
+        return q
+
+    def run_qkv():
+        return attn.qkv_proj(normed)
+
+    if fused:
+        q, k, v = run_fused_qkv(), None, None
+    else:
+        qkv, _ = run_qkv()
+        q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
 
     def run_attn():
         from sglang.srt.model_executor.forward_context import forward_context
         with forward_context(ctx):
-            return attn.attn(q, k, v, forward_batch, save_kv_cache=True)
+            # The fused kernel left K/V in the cache, so attention must not
+            # write them a second time.
+            return attn.attn(q, k, v, forward_batch, save_kv_cache=not fused)
 
     attn_out = run_attn()
 
@@ -200,12 +248,17 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
         d, _ = mlp.down_proj(act_out)
         return d
 
-    def run_norm():
-        return norm(hidden_states)
+    # The fused kernel owns the KV-cache write, so it is not attention's
+    # traffic any more.
+    attn_bytes -= 2 * B_req * S_kv * kv_dim * bpe if fused else 0
 
-    return [
-        Op("input_layernorm", run_norm, norm_macs, norm_bytes),
-        Op("qkv_proj", run_qkv, qkv_macs, qkv_bytes),
+    ops = [Op("input_layernorm", run_norm, norm_macs, norm_bytes)]
+    ops.append(
+        Op("qkv_fused", run_fused_qkv, fused_macs, fused_bytes, "+norm+rope+kv")
+        if fused
+        else Op("qkv_proj", run_qkv, qkv_macs, qkv_bytes)
+    )
+    return ops + [
         Op("attn(flash)", run_attn, attn_macs, attn_bytes, "causal; S_kv=T"),
         Op("o_proj", run_oproj, o_macs, o_bytes),
         Op("post_attn_norm", run_norm, norm_macs, norm_bytes),
