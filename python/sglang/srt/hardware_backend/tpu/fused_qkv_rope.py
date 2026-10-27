@@ -32,11 +32,46 @@ from sglang.srt.hardware_backend.tpu.trace import trace_tpu_kernel
 #: only place that pays for it.
 _KERNELS: dict[tuple, object] = {}
 
-#: Query-row tile in tokens.  ``block_M`` is baked, so a short decode batch gets
-#: its own small-tile build instead of running 63/64 of a tile empty.
-_BLOCK_M_BIG = 64
-_BLOCK_M_SMALL = 16
+#: Query-row tile in tokens, largest first.  ``block_M`` is the GEMM's M and the
+#: kernel's dominant knob: at T=8192 it is 15.05 ms at 64 vs 5.22 ms at 4096,
+#: because the tile sets both the fmm2 shape and how many m-tile sweeps the job
+#: runs.  It is not free to grow, though -- rows past the batch are padded work,
+#: so past the token count a wider tile loses badly (T=256: 0.475 ms at 256 vs
+#: 1.691 at 1024).  ``_pick_block_m`` trades the two against each other.
+_BLOCK_M_LADDER = (4096, 2048, 1024, 512, 256, 128, 64)
 _BLOCK_K = 256
+
+#: Measured cost of one padded token row, in microseconds, per tile width.  The
+#: 64-4096 entries come from the T=8192 sweep, 128/256 from T=1024 and T=256.
+#: Only the ratios matter -- the pick multiplies them by the padded row count.
+#: 64 is the narrowest tile on purpose: at T=1/17/32 it measured 0.455-0.469 ms,
+#: the same as a 16-row tile (both are launch-bound), so 16 would only add a
+#: kernel build to every serving process for nothing.
+_ROW_COST_US = {
+    64: 1.84,
+    128: 1.32,
+    256: 0.90,
+    512: 0.75,
+    1024: 0.68,
+    2048: 0.65,
+    4096: 0.64,
+}
+
+
+def _pick_block_m(num_tokens: int) -> int:
+    """The tile minimising ``padded rows * measured per-row cost``.
+
+    Minimising padding alone is not enough -- it picks a 16-row tile for a
+    1000-token batch -- and maximising the tile alone over-pads (a 4096 tile
+    rounds 5000 tokens up to 8192, which costs more than the wider GEMM saves).
+    """
+    return min(
+        _BLOCK_M_LADDER,
+        key=lambda block_m: (
+            -(-num_tokens // block_m) * block_m * _ROW_COST_US[block_m]
+        ),
+    )
+
 
 def kernel_geometry_ok(
     *,
@@ -237,7 +272,7 @@ class TpuFusedQkvRope:
         """
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
-        block_m = _BLOCK_M_BIG if num_tokens >= _BLOCK_M_BIG else _BLOCK_M_SMALL
+        block_m = _pick_block_m(num_tokens)
         padded = -(-num_tokens // block_m) * block_m
 
         kernel = self._make_kernel(
