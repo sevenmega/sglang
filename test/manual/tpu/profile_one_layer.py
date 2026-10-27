@@ -33,6 +33,14 @@ against the ``input_layernorm`` + ``qkv_proj`` rows: those two account for only
 half of what the kernel absorbs, and the other half (qk-norm, RoPE) is the
 expensive one -- on the torch path it is several times the GEMM.
 
+``SGLANG_TPU_USE_FUSED_MLP=1`` measures ``gate_up_proj`` + ``silu_mul`` +
+``down_proj`` as one kernel (``mlp_fused``) in place of those three rows, with a
+``torch equivalent of the fused MLP row`` line to read it against. It is the
+layer's own op (``Qwen3DecoderLayer._tpu_fused_mlp``), gated by the model's own
+predicate, so a batch the kernel declines shows the torch rows. What it buys is
+the ``[T, I]`` intermediate: the fusion moves X, Y and the weights, and the
+100 MB round trip between the three torch rows is gone.
+
 Before any of that, the script times ``one_batch``'s own prefill step -- its
 module-level ``extend``, the exact region ``latency_test_run_once`` brackets --
 so there is always a number belonging to the real program (batch prep + KV
@@ -368,6 +376,51 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
         d, _ = mlp.down_proj(act_out)
         return d
 
+    # The fused MLP is the layer's own op -- built once at construction, so the
+    # e2e warmup above already paid its compile.  When the flag builds it, the
+    # three torch rows collapse into one and the ``[T, I]`` intermediate stops
+    # crossing DDR.
+    fused_mlp = layer._tpu_fused_mlp
+    mlp_fused = fused_mlp is not None
+
+    def run_mlp_fused():
+        return fused_mlp(x=o_out)
+
+    def run_torch_mlp_chain():
+        gu, _ = mlp.gate_up_proj(o_out)
+        d, _ = mlp.down_proj(mlp.act_fn(gu))
+        return d
+
+    if fused_mlp is None:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_TPU_USE_FUSED_MLP.get():
+            print(
+                "[prof] SGLANG_TPU_USE_FUSED_MLP=1 but this layer failed the "
+                "construction gate -> torch MLP rows, as in the model",
+                flush=True,
+            )
+    elif not mlp_fused:
+        print(
+            "[prof] SGLANG_TPU_USE_FUSED_MLP=1 but this batch failed the gate "
+            f"(T={T}) -> torch MLP rows, as in the model",
+            flush=True,
+        )
+    else:
+        print(
+            "[prof] SGLANG_TPU_USE_FUSED_MLP=1 -> gate_up_proj + silu_mul + "
+            "down_proj are measured as one kernel, no [T, I] intermediate",
+            flush=True,
+        )
+        print(
+            "[prof] torch equivalent of the fused MLP row, isolated 3 ops: "
+            f"{time_op(run_torch_mlp_chain)*1e6:.1f} us",
+            flush=True,
+        )
+
+    # X + Y + the whole weight set; the fused op moves no [T, I].
+    mlp_fused_bytes = (2 * I * H + I * H + 2 * T * H) * bpe
+
     # The fused kernel owns the KV-cache write, so it is not attention's
     # traffic any more.
     attn_bytes -= 2 * B_req * S_kv * kv_dim * bpe if fused else 0
@@ -391,14 +444,31 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
         )
     else:
         ops.append(Op("qkv_proj", run_qkv, qkv_macs, qkv_bytes))
-    return ops + [
-        Op("attn(flash)", run_attn, attn_macs, attn_bytes, "causal; S_kv=T"),
-        Op("o_proj", run_oproj, o_macs, o_bytes),
-        Op("post_attn_norm", run_norm, norm_macs, norm_bytes),
-        Op("gate_up_proj", run_gate_up, gu_macs, gu_bytes),
-        Op("silu_mul", run_act, T * I, 3 * T * I * bpe),
-        Op("down_proj", run_down, down_macs, down_bytes),
-    ]
+    if mlp_fused:
+        mlp_ops = [
+            Op(
+                "mlp_fused",
+                run_mlp_fused,
+                gu_macs + T * I + down_macs,
+                mlp_fused_bytes,
+                "+silu_mul",
+            )
+        ]
+    else:
+        mlp_ops = [
+            Op("gate_up_proj", run_gate_up, gu_macs, gu_bytes),
+            Op("silu_mul", run_act, T * I, 3 * T * I * bpe),
+            Op("down_proj", run_down, down_macs, down_bytes),
+        ]
+    return (
+        ops
+        + [
+            Op("attn(flash)", run_attn, attn_macs, attn_bytes, "causal; S_kv=T"),
+            Op("o_proj", run_oproj, o_macs, o_bytes),
+            Op("post_attn_norm", run_norm, norm_macs, norm_bytes),
+        ]
+        + mlp_ops
+    )
 
 
 def main():

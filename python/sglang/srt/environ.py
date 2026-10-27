@@ -487,6 +487,16 @@ class Envs:
     # OFF by default, same reasons as above; it additionally changes the fp32
     # projection into the normalized one, so a greedy near-tie can flip.
     SGLANG_TPU_USE_FUSED_QKV_LN = EnvBool(False)
+    # Fuse the post-attention MLP -- ``gate_up_proj`` -> ``silu_mul`` ->
+    # ``down_proj`` -- into one kernel that keeps the ``[T, 2I]`` intermediate on
+    # chip.  The win is traffic, not launch count: at T=8192 the two elementwise
+    # rows move ~200 MB of the 330 MB the three ops cost.
+    #
+    # OFF by default: it needs a per-shape kernel build (~1 min) at first use and
+    # only engages for an unquantized bf16 MLP with tensor parallelism of one
+    # (the kernel has no all-reduce), so greedy outputs can differ on near-ties.
+    # Only the Qwen3 TPU path is wired; anything else ignores it.
+    SGLANG_TPU_USE_FUSED_MLP = EnvBool(False)
     # Log every flash-attention launch (shape + batch size) to stderr, and the
     # deduplicated union plus launch count at process exit. TEMP diagnostic.
     SGLANG_TPU_LOG_FLASH_SHAPES = EnvBool(False)

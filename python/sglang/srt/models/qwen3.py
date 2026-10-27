@@ -62,6 +62,10 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
 
 if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.fused_mlp import (
+        TpuFusedMlp,
+        mlp_geometry_ok,
+    )
     from sglang.srt.hardware_backend.tpu.fused_qkv_ln import TpuFusedQkvLn
     from sglang.srt.hardware_backend.tpu.fused_qkv_rope import (
         TpuFusedQkvRope,
@@ -583,6 +587,47 @@ class Qwen3DecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
         self.self_attn._attach_input_layernorm(self.input_layernorm)
+        self._tpu_fused_mlp = self._build_tpu_fused_mlp(
+            quant_config=quant_config,
+            intermediate_size=config.intermediate_size,
+            layer_id=layer_id,
+        )
+
+    def _build_tpu_fused_mlp(
+        self, *, quant_config, intermediate_size: int, layer_id: int
+    ):
+        """The fused gate_up/silu_mul/down op, or None to keep the torch chain.
+
+        Decided once, here: device, quantization and tensor parallelism are all
+        fixed for the layer's lifetime.  ``prepare_mlp`` normalizes the hidden
+        state before the MLP runs, which is exactly what the kernel consumes, so
+        no norm is fused in and the layer keeps its ``prepare_mlp`` boundary.
+        """
+        if not (_is_tpu and envs.SGLANG_TPU_USE_FUSED_MLP.get()):
+            return None
+        if quant_config is not None:
+            return None
+        if get_parallel().tp_size != 1:
+            # down_proj is row-parallel: above TP=1 it owns a slice of the I
+            # reduction and all-reduces afterwards, which the kernel does not do.
+            return None
+        if not mlp_geometry_ok(
+            hidden_size=self.hidden_size, intermediate_size=intermediate_size
+        ):
+            logger.warning(
+                "TPU fused MLP disabled for layer %s: geometry (H=%d, I=%d) is "
+                "outside the kernel's contract",
+                layer_id,
+                self.hidden_size,
+                intermediate_size,
+            )
+            return None
+        return TpuFusedMlp(
+            gate_up_proj=self.mlp.gate_up_proj,
+            down_proj=self.mlp.down_proj,
+            hidden_size=self.hidden_size,
+            intermediate_size=intermediate_size,
+        )
 
     def forward(
         self,
@@ -632,7 +677,10 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
-        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+        if self._tpu_fused_mlp is not None:
+            hidden_states = self._tpu_fused_mlp(x=hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
