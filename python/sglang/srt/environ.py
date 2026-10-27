@@ -478,6 +478,15 @@ class Envs:
     # normalizes a bf16-rounded one, so greedy outputs can differ on near-ties.
     # Only the Qwen3 TPU path is wired; anything else ignores it.
     SGLANG_TPU_USE_FUSED_QKV_ROPE = EnvBool(False)
+    # Same fusion, plus the layer's ``input_layernorm``: the kernel is handed
+    # ``hidden + residual`` un-normalized and does the norm on chip, which also
+    # removes the ``prepare_attn`` boundary (the layer carries that sum forward
+    # as its residual instead of the normed value).  This supersedes
+    # ``SGLANG_TPU_USE_FUSED_QKV_ROPE`` when both are on.
+    #
+    # OFF by default, same reasons as above; it additionally changes the fp32
+    # projection into the normalized one, so a greedy near-tie can flip.
+    SGLANG_TPU_USE_FUSED_QKV_LN = EnvBool(False)
     # Log every flash-attention launch (shape + batch size) to stderr, and the
     # deduplicated union plus launch count at process exit. TEMP diagnostic.
     SGLANG_TPU_LOG_FLASH_SHAPES = EnvBool(False)

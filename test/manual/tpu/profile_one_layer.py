@@ -15,9 +15,34 @@ separate attention KV write (the fused kernel already did it). The gate is the
 same one the model uses (``Qwen3Attention._tpu_fused_ok``), so a layer/device
 the kernel cannot serve silently keeps the torch rows.
 
+``SGLANG_TPU_USE_FUSED_QKV_LN=1`` selects the milestone-B kernel instead: the
+same chain with the layer's ``input_layernorm`` folded in. It normalizes on
+chip, so it is measured on the *raw* hidden (what the layer hands over) and the
+separate ``input_layernorm`` row disappears from the table -- it is now the
+kernel's first act. That flag supersedes the RoPE one (the model drops the
+projection-only op whenever the norm-fused one is built), and the gate here is
+likewise the model's (``Qwen3Attention._tpu_fused_ln_ok``).
+
+Both fused variants are only worth measuring with ``PPL_ASYNC_LAUNCH=1``. The
+default synchronous PPL launch brackets every kernel with a device-wide drain, so
+the fused rows (and the e2e layer) come out 2-4x slower and erratic -- correct
+numbers, meaningless ones. Compare like for like: same flag on the torch run.
+
+Read the fused row against the ``torch equivalent of the fused row`` line, never
+against the ``input_layernorm`` + ``qkv_proj`` rows: those two account for only
+half of what the kernel absorbs, and the other half (qk-norm, RoPE) is the
+expensive one -- on the torch path it is several times the GEMM.
+
+Before any of that, the script times ``one_batch``'s own prefill step -- its
+module-level ``extend``, the exact region ``latency_test_run_once`` brackets --
+so there is always a number belonging to the real program (batch prep + KV
+allocation + every layer + sampling) to read the decomposition against. Pass it
+the same ``--batch-size``/``--input-len`` you would pass the benchmark.
+
 Run:
     SGLANG_TPU_DEVICE_ID=5 python3 profile_one_layer.py --batch-size 32 --input-len 256
-    SGLANG_TPU_USE_FUSED_QKV_ROPE=1 python3 profile_one_layer.py
+    PPL_ASYNC_LAUNCH=1 SGLANG_TPU_USE_FUSED_QKV_ROPE=1 python3 profile_one_layer.py
+    PPL_ASYNC_LAUNCH=1 SGLANG_TPU_USE_FUSED_QKV_LN=1 python3 profile_one_layer.py
 """
 
 from __future__ import annotations
@@ -59,6 +84,38 @@ def time_op(fn, rounds: int = MEASURE_ROUNDS) -> float:
         SYNC()
         samples.append(time.perf_counter() - tic)
     return statistics.median(samples)
+
+
+def time_benchmark_prefill(
+    *, bench_runner, model_runner, batch_size: int, input_len: int, rounds: int = 3
+) -> float:
+    """The prefill number ``python -m sglang.benchmark.one_batch`` reports.
+
+    ``latency_test_run_once`` brackets ``model_runner.extend(reqs)`` with a
+    synchronize, so that number is batch prep + KV allocation + the whole
+    multi-layer forward + sampling.  Calling the module-level ``extend`` (what
+    ``_TorchBenchRunner.extend`` calls) runs the identical program, so this is
+    directly comparable to one_batch's output instead of being a look-alike.
+
+    ``extend`` mutates the requests and allocates KV slots, so both are rebuilt
+    every round -- which is what a fresh one_batch run does.  The first round is
+    discarded: it pays the fused kernel's compile/build.
+    """
+    from sglang.benchmark.one_batch import (
+        extend as one_batch_extend,
+        prepare_synthetic_inputs_for_latency_test,
+    )
+
+    samples = []
+    for _ in range(WARMUP_ROUNDS + rounds):
+        reqs = prepare_synthetic_inputs_for_latency_test(batch_size, input_len)
+        bench_runner.clear()
+        SYNC()
+        tic = time.perf_counter()
+        one_batch_extend(reqs, model_runner)
+        SYNC()
+        samples.append(time.perf_counter() - tic)
+    return statistics.median(samples[WARMUP_ROUNDS:])
 
 
 class Op:
@@ -176,21 +233,57 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
     def run_norm():
         return norm(hidden_states)
 
-    # The fused kernel takes the *post*-input_layernorm hidden (folding the LN
-    # in is the deferred milestone), so it gets the same tensor this row times.
-    normed = run_norm()
-    fused = attn._tpu_fused_ok(normed, forward_batch)
-    if fused:
+    # Two fused variants, exactly as the model picks between them: the ``_ln``
+    # one folds the input norm in and takes the raw hidden, the other takes the
+    # post-norm hidden.  They are mutually exclusive by construction -- building
+    # the norm-fused op nulls the projection-only one -- so asking the ``_ln``
+    # gate first cannot mask a working rope op.
+    fused_ln = attn._tpu_fused_ln_ok(
+        hidden_states, forward_batch, post_residual_addition=None
+    )
+    fused_rope = False
+    normed = None  # nothing normalizes ahead of the kernel in the fused-LN case
+    if not fused_ln:
+        normed = run_norm()
+        fused_rope = attn._tpu_fused_ok(normed, forward_batch)
+    fused = fused_ln or fused_rope
+
+    if fused_ln:
+        print(
+            "[prof] SGLANG_TPU_USE_FUSED_QKV_LN=1 -> qkv_proj is measured as the "
+            "fused input-norm+qk-norm+RoPE+KV-cache-write kernel, on the raw "
+            "hidden and without a separate input_layernorm row (the e2e warmup "
+            "above already paid its compile)",
+            flush=True,
+        )
+    elif fused:
         print(
             "[prof] SGLANG_TPU_USE_FUSED_QKV_ROPE=1 -> qkv_proj is measured as "
             "the fused qk-norm+RoPE+KV-cache-write kernel (the e2e warmup above "
             "already paid its compile)",
             flush=True,
         )
+    else:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_TPU_USE_FUSED_QKV_LN.get():
+            flag = "SGLANG_TPU_USE_FUSED_QKV_LN"
+        elif envs.SGLANG_TPU_USE_FUSED_QKV_ROPE.get():
+            flag = "SGLANG_TPU_USE_FUSED_QKV_ROPE"
+        else:
+            flag = None
+        if flag is not None:
+            print(
+                f"[prof] {flag}=1 but this layer/forward failed the gate -> "
+                "torch rows, which is what the model would run too",
+                flush=True,
+            )
 
     # qk-norm (sum of squares, then scale) and RoPE (3 mul-adds per rotated
-    # element) run over q and k only, so they ride on top of the GEMM macs.
-    fused_macs = qkv_macs + 5 * T * (q_dim + kv_dim)
+    # element) run over q and k only, so they ride on top of the GEMM macs.  The
+    # input norm adds a square-and-reduce pass over the whole hidden.
+    ln_macs = T * H if fused_ln else 0
+    fused_macs = qkv_macs + 5 * T * (q_dim + kv_dim) + ln_macs
     fused_bytes = (
         (
             H * (q_dim + 2 * kv_dim)  # qkv weight
@@ -198,6 +291,7 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
             + T * q_dim  # Q out
             + T * D  # cos|sin rows for this batch
             + 2 * T * kv_dim  # k/v scattered into the cache
+            + (H if fused_ln else 0)  # input-norm gamma, folded into the weight
         )
         * bpe
         + 2 * Hkv * T * 4  # kv_row table is uint32
@@ -206,8 +300,34 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
     def run_fused_qkv():
         from sglang.srt.model_executor.forward_context import forward_context
         with forward_context(ctx):
-            q, _, _ = attn.forward_prepare_tpu(positions, normed, forward_batch)
+            if fused_ln:
+                q, _, _ = attn.forward_prepare_tpu(
+                    positions, hidden_states, forward_batch, with_input_norm=True
+                )
+            else:
+                q, _, _ = attn.forward_prepare_tpu(positions, normed, forward_batch)
         return q
+
+    # The fused row absorbs six torch stages, but the table only has rows for
+    # two of them (the norm, the GEMM): qk-norm and RoPE are folded into no row
+    # at all.  Time the whole chain so the fused row has a like-for-like
+    # baseline instead of looking worse than the work it replaces.  The two
+    # paged-cache writes are excluded -- in the torch path they run inside the
+    # attention row, which is exactly why that row is discounted when fused.
+    # ``input_layernorm`` is included only for the fused-LN row, which is the
+    # only one that has the norm inside it.
+    def run_torch_chain():
+        from sglang.srt.model_executor.forward_context import forward_context
+        x = run_norm() if fused_ln else normed
+        with forward_context(ctx):
+            attn.forward_prepare_native(positions=positions, hidden_states=x)
+
+    print(
+        "[prof] torch equivalent of the fused row, isolated "
+        f"({'norm + ' if fused_ln else ''}GEMM + qk-norm + RoPE, no cache write): "
+        f"{time_op(run_torch_chain)*1e6:.1f} us",
+        flush=True,
+    )
 
     def run_qkv():
         return attn.qkv_proj(normed)
@@ -252,12 +372,25 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
     # traffic any more.
     attn_bytes -= 2 * B_req * S_kv * kv_dim * bpe if fused else 0
 
-    ops = [Op("input_layernorm", run_norm, norm_macs, norm_bytes)]
-    ops.append(
-        Op("qkv_fused", run_fused_qkv, fused_macs, fused_bytes, "+norm+rope+kv")
-        if fused
-        else Op("qkv_proj", run_qkv, qkv_macs, qkv_bytes)
-    )
+    # With the norm fused, the input_layernorm row is part of the kernel above,
+    # not a launch of its own.
+    ops = [] if fused_ln else [Op("input_layernorm", run_norm, norm_macs, norm_bytes)]
+    if fused_ln:
+        ops.append(
+            Op(
+                "qkv_fused_ln",
+                run_fused_qkv,
+                fused_macs,
+                fused_bytes,
+                "+ln+qk-norm+rope+kv",
+            )
+        )
+    elif fused:
+        ops.append(
+            Op("qkv_fused", run_fused_qkv, fused_macs, fused_bytes, "+norm+rope+kv")
+        )
+    else:
+        ops.append(Op("qkv_proj", run_qkv, qkv_macs, qkv_bytes))
     return ops + [
         Op("attn(flash)", run_attn, attn_macs, attn_bytes, "causal; S_kv=T"),
         Op("o_proj", run_oproj, o_macs, o_bytes),
@@ -294,6 +427,7 @@ def main():
     import argparse as _ap
 
     from sglang.benchmark.one_batch import (
+        TreeCacheNamespace,
         _maybe_prepare_mlp_sync_batch,
         load_model,
         prepare_synthetic_inputs_for_latency_test,
@@ -303,8 +437,6 @@ def main():
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.runtime_context import get_parallel
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-    from types import SimpleNamespace
 
     suppress_other_loggers()
 
@@ -327,18 +459,33 @@ def main():
     SYNC = lambda: torch.get_device_module(dev).synchronize()
     print(f"[prof] device={dev}", flush=True)
 
+    # --- the benchmark's own number, on the benchmark's own code path ------
+    # Same program as ``python -m sglang.benchmark.one_batch``: this is the
+    # latency it prints for prefill, so the per-layer rows below can be read
+    # against a number that belongs to the real program.
+    model = model_runner.model
+    layers = model.model.layers if hasattr(model, "model") else model.layers
+    cfg = model.config if hasattr(model, "config") else model_runner.model_config.hf_config
+    print(f"[prof] layers = {len(layers)}", flush=True)
+
+    bench_s = time_benchmark_prefill(
+        bench_runner=bench_runner,
+        model_runner=model_runner,
+        batch_size=args.batch_size,
+        input_len=args.input_len,
+    )
+    print(
+        f"[prof] one_batch prefill step (B={args.batch_size} x S={args.input_len}, "
+        f"prep + {len(layers)} layers + sample): {bench_s*1e3:.2f} ms",
+        flush=True,
+    )
+
     # --- build the prefill batch -------------------------------------------
     reqs = prepare_synthetic_inputs_for_latency_test(args.batch_size, args.input_len)
     bench_runner.clear()
 
-    class _TreeCache(SimpleNamespace):
-        def supports_swa(self): return False
-        def supports_mamba(self): return False
-        def is_chunk_cache(self): return False
-        def is_tree_cache(self): return not self.is_chunk_cache()
-        def evict(self, params): pass
-
-    tree = _TreeCache(
+    # The benchmark's own dummy tree cache -- not a local copy of it.
+    tree = TreeCacheNamespace(
         page_size=server_args.page_size,
         device=dev,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
@@ -359,11 +506,6 @@ def main():
         batch.prefill_input_ids_cpu = None
     fwd = ForwardBatch.init_new(batch, model_runner, return_hidden_states_before_norm=False)
     print(f"[prof] prefill tokens T = {fwd.input_ids.shape[0]}", flush=True)
-
-    model = model_runner.model
-    layers = model.model.layers if hasattr(model, "model") else model.layers
-    cfg = model.config if hasattr(model, "config") else model_runner.model_config.hf_config
-    print(f"[prof] layers = {len(layers)}", flush=True)
 
     # The attention backend is read from an ambient forward context that
     # ModelRunner._forward_raw installs; a bare layer call needs it too.
@@ -436,12 +578,20 @@ def main():
         f"-> overlap/launch gap = {(total_t-e2e_s)*1e6:+.1f} us"
     )
 
-    # --- whole-model extrapolation -----------------------------------------
+    # --- against the benchmark's own number --------------------------------
     n_layers = len(layers)
     prefill_lat = e2e_s * n_layers
     print(
-        f"\n[prof] extrapolated prefill ({n_layers} layers x {e2e_s*1e6:.1f} us) "
-        f"= {prefill_lat*1e3:.2f} ms; measured run was ~7.6 s"
+        f"\n[prof] {n_layers} x per-layer e2e = {prefill_lat*1e3:.2f} ms vs "
+        f"one_batch prefill step = {bench_s*1e3:.2f} ms -> "
+        f"{prefill_lat*1e3 - bench_s*1e3:+.2f} ms"
+    )
+    print(
+        "[prof] the step is the truth: it includes batch prep, KV allocation and "
+        "sampling that no row above carries, and it drains the device once "
+        "instead of once per row. A per-layer sum that lands below it is the "
+        "drain cost -- per-layer rows are serialized upper bounds, not a "
+        "decomposition that must add up."
     )
 
 

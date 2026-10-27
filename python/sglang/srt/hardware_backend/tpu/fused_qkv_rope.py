@@ -149,6 +149,24 @@ class TpuFusedQkvRope:
             self._gamma_key = key
         return self._gamma
 
+    # -- kernel selection -------------------------------------------------- #
+
+    def _make_kernel(self, *, hidden_size: int, block_m: int, eps: float, torch_dtype):
+        """The compiled kernel for this layer's geometry."""
+        return _get_kernel(
+            hidden_size=hidden_size,
+            num_heads=self._num_heads,
+            num_kv_heads=self._num_kv_heads,
+            head_dim=self._head_dim,
+            block_m=block_m,
+            eps=eps,
+            torch_dtype=torch_dtype,
+        )
+
+    def _projection_weight(self) -> torch.Tensor:
+        """The ``[Ntot, H]`` weight the kernel contracts against."""
+        return self._qkv_proj.weight
+
     # -- per-launch buffers ------------------------------------------------ #
 
     def _cache_views(self, k_cache, v_cache):
@@ -216,11 +234,8 @@ class TpuFusedQkvRope:
         block_m = _BLOCK_M_BIG if num_tokens >= _BLOCK_M_BIG else _BLOCK_M_SMALL
         padded = -(-num_tokens // block_m) * block_m
 
-        kernel = _get_kernel(
+        kernel = self._make_kernel(
             hidden_size=hidden_size,
-            num_heads=self._num_heads,
-            num_kv_heads=self._num_kv_heads,
-            head_dim=self._head_dim,
             block_m=block_m,
             eps=eps,
             torch_dtype=hidden_states.dtype,
@@ -256,7 +271,7 @@ class TpuFusedQkvRope:
         slots = out_cache_loc.view(1, -1).to(torch.int32)
         kv_row[:, :num_tokens] = slots * (2 * self._num_kv_heads) + rows.view(-1, 1)
 
-        q = kernel(x, self._qkv_proj.weight, cos_rows, self._gamma_table(),
+        q = kernel(x, self._projection_weight(), cos_rows, self._gamma_table(),
                    kv_row, k_flat, v_flat)
         # Same shape contract as ``forward_prepare_native``: the attention
         # backend and ``torch.empty_like(q)`` below it both assume the packed

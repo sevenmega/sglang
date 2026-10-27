@@ -62,6 +62,7 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
 
 if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.fused_qkv_ln import TpuFusedQkvLn
     from sglang.srt.hardware_backend.tpu.fused_qkv_rope import (
         TpuFusedQkvRope,
         kernel_geometry_ok,
@@ -178,38 +179,50 @@ class Qwen3Attention(nn.Module):
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
         self._tpu_fused_qkv_rope = self._build_tpu_fused_qkv_rope()
+        # The norm-fused variant is built by the decoder layer, which owns the
+        # ``input_layernorm`` the kernel needs (``_attach_input_layernorm``).
+        self._tpu_fused_qkv_ln = None
 
-    def _build_tpu_fused_qkv_rope(self):
-        """The TPU fused qkv/norm/RoPE/cache-write op, or None to keep torch.
+    def _tpu_fused_geometry_ok(self) -> bool:
+        """Whether the fused qkv kernel can serve this layer's geometry at all.
 
-        Decided once, here, because every condition is a property of the layer's
-        geometry: the kernel bakes the head layout and its own query-row tile, so
-        a layer that does not match exactly must not reach it.  The per-forward
-        checks (dtype, cross attention, sliding window) live at the call site.
+        The kernel bakes the head layout, so a layer that does not match exactly
+        must never reach it.
         """
-        if not (_is_tpu and envs.SGLANG_TPU_USE_FUSED_QKV_ROPE.get()):
-            return None
         if isinstance(self.rotary_emb, MRotaryEmbedding):
-            return None
+            return False
         if not self.rotary_emb.is_neox_style:
-            return None
+            return False
         if self.rotary_emb.rotary_dim != self.head_dim:
-            return None
-        if not kernel_geometry_ok(
+            return False
+        if kernel_geometry_ok(
             hidden_size=self.hidden_size,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
         ):
-            logger.warning(
-                "TPU fused qkv/rope disabled for layer %s: head geometry "
-                "(H=%d, Hq=%d, Hkv=%d, D=%d) is outside the kernel's contract",
-                self.attn.layer_id,
-                self.hidden_size,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-            )
+            return True
+        logger.warning(
+            "TPU fused qkv/rope disabled for layer %s: head geometry "
+            "(H=%d, Hq=%d, Hkv=%d, D=%d) is outside the kernel's contract",
+            self.attn.layer_id,
+            self.hidden_size,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+        )
+        return False
+
+    def _build_tpu_fused_qkv_rope(self):
+        """The TPU fused qkv/norm/RoPE/cache-write op, or None to keep torch.
+
+        Decided once, here, because every condition is a property of the layer's
+        geometry.  The per-forward checks (dtype, cross attention, sliding
+        window) live at the call site.
+        """
+        if not (_is_tpu and envs.SGLANG_TPU_USE_FUSED_QKV_ROPE.get()):
+            return None
+        if not self._tpu_fused_geometry_ok():
             return None
         return TpuFusedQkvRope(
             qkv_proj=self.qkv_proj,
@@ -220,19 +233,77 @@ class Qwen3Attention(nn.Module):
             head_dim=self.head_dim,
         )
 
-    def _tpu_fused_ok(self, hidden_states, forward_batch) -> bool:
-        """Per-forward gate: the layout the kernel consumes, nothing else."""
+    def _attach_input_layernorm(self, input_layernorm) -> None:
+        """Build the norm-fused op against the layer's pre-attention norm.
+
+        The kernel takes ``hidden + residual`` un-normalized and applies the norm
+        itself, so it needs that norm's weight and epsilon -- which belong to the
+        decoder layer, not to the attention.  When it is built the projection-only
+        op is dropped: this one does everything it does, and building both would
+        compile two kernels where one will ever run.
+        """
+        self._tpu_fused_qkv_ln = self._build_tpu_fused_qkv_ln(input_layernorm)
+        if self._tpu_fused_qkv_ln is not None:
+            self._tpu_fused_qkv_rope = None
+
+    def _build_tpu_fused_qkv_ln(self, input_layernorm):
+        """The input-norm-fused op, or None to keep the torch chain."""
+        if not (_is_tpu and envs.SGLANG_TPU_USE_FUSED_QKV_LN.get()):
+            return None
+        if not self._tpu_fused_geometry_ok():
+            return None
+        return TpuFusedQkvLn(
+            qkv_proj=self.qkv_proj,
+            input_layernorm=input_layernorm,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            ln_eps=input_layernorm.variance_epsilon,
+        )
+
+    def _tpu_fused_batch_ok(self, hidden_states, forward_batch) -> bool:
+        """Conditions both fused prepares share: the layout they consume, nothing
+        else -- bf16 activations, a plain self-attention layer with no sliding
+        window, and a paged-cache slot per token."""
         return (
-            self._tpu_fused_qkv_rope is not None
-            and hidden_states.dtype == torch.bfloat16
+            hidden_states.dtype == torch.bfloat16
             and not self.attn.is_cross_attention
             and self.attn.sliding_window_size < 0
             and forward_batch.out_cache_loc is not None
             and get_exec().deterministic.rl_on_policy_target is None
         )
 
-    def forward_prepare_tpu(self, positions, hidden_states, forward_batch):
-        """Fused qkv_proj + qk-norm + RoPE + paged-cache write.
+    def _tpu_fused_ok(self, hidden_states, forward_batch) -> bool:
+        """Per-forward gate for the projection-only op."""
+        return self._tpu_fused_qkv_rope is not None and self._tpu_fused_batch_ok(
+            hidden_states, forward_batch
+        )
+
+    def _tpu_fused_ln_ok(
+        self, hidden_states, forward_batch, post_residual_addition
+    ) -> bool:
+        """Per-forward gate for the norm-fused op, asked by the decoder layer.
+
+        The layer asks because it has to hand over an *unnormalized* sum instead
+        of running ``prepare_attn``; the attention is told the answer rather than
+        re-deriving it, so the two can never disagree about who normalized.
+        """
+        return (
+            self._tpu_fused_qkv_ln is not None
+            and post_residual_addition is None
+            and self._tpu_fused_batch_ok(hidden_states, forward_batch)
+        )
+
+    def forward_prepare_tpu(
+        self, positions, hidden_states, forward_batch, *, with_input_norm=False
+    ):
+        """Fused [input norm] + qkv_proj + qk-norm + RoPE + paged-cache write.
+
+        ``with_input_norm`` means ``hidden_states`` is the layer's raw
+        ``hidden + residual`` and the kernel normalizes it; otherwise it is
+        already normalized (the projection-only variant).
 
         K/V are in the cache when this returns, so the attention backend must not
         write them again: the caller passes save_kv_cache=False and (q, None,
@@ -242,15 +313,18 @@ class Qwen3Attention(nn.Module):
         # leaves cos_sin_cache on its init device (CPU).  Same call, same
         # effect: move it to the activation's device and dtype.
         logger.info_once(
-            "TPU fused qkv/rope engaged: hidden=%d, heads=%d/%d, head_dim=%d",
+            "TPU fused qkv/rope engaged: hidden=%d, heads=%d/%d, head_dim=%d, "
+            "input_norm=%s",
             hidden_states.shape[1],
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
+            with_input_norm,
         )
         self.rotary_emb._match_cos_sin_cache_dtype(hidden_states)
         k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.attn.layer_id)
-        q = self._tpu_fused_qkv_rope(
+        op = self._tpu_fused_qkv_ln if with_input_norm else self._tpu_fused_qkv_rope
+        q = op(
             hidden_states=hidden_states,
             positions=positions,
             cos_sin_cache=self.rotary_emb.cos_sin_cache,
@@ -362,6 +436,8 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        *,
+        fused_input_norm: bool = False,
     ) -> torch.Tensor:
         if get_exec().deterministic.rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
@@ -373,7 +449,14 @@ class Qwen3Attention(nn.Module):
             and get_exec().deterministic.rl_on_policy_target is None
         )
 
-        if self._tpu_fused_ok(hidden_states, forward_batch):
+        if fused_input_norm:
+            # The layer handed over hidden + residual un-normalized; the kernel
+            # applies the input norm, so it must not be normalized here too.
+            q, k, v = self.forward_prepare_tpu(
+                positions, hidden_states, forward_batch, with_input_norm=True
+            )
+            save_kv_cache = False
+        elif self._tpu_fused_ok(hidden_states, forward_batch):
             q, k, v = self.forward_prepare_tpu(
                 positions, hidden_states, forward_batch
             )
@@ -402,6 +485,24 @@ class Qwen3Attention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
         output, _ = self.o_proj(attn_output)
         return output
+
+
+def _fused_ln_residual(
+    hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The residual half of ``prepare_attn``, with the norm left to the kernel.
+
+    Reproduces ``RMSNorm.forward_native``'s arithmetic: the sum is formed in fp32
+    and rounded once, so the residual stream stays bit-identical to the torch
+    path's instead of drifting a bf16 ulp per layer.  ``residual is None`` (the
+    first layer) and the empty batch mirror ``prepare_attn``: the carried
+    residual is exactly what came in.  ``post_residual_addition`` never reaches
+    here -- the fused path's gate requires it to be None.
+    """
+    if residual is None or hidden_states.shape[0] == 0:
+        return hidden_states, hidden_states
+    summed = (hidden_states.float() + residual.float()).to(hidden_states.dtype)
+    return summed, summed
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -481,6 +582,7 @@ class Qwen3DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
         )
+        self.self_attn._attach_input_layernorm(self.input_layernorm)
 
     def forward(
         self,
@@ -491,17 +593,27 @@ class Qwen3DecoderLayer(nn.Module):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-            post_residual_addition=post_residual_addition,
+        fused_input_norm = self.self_attn._tpu_fused_ln_ok(
+            hidden_states, forward_batch, post_residual_addition
         )
+        if fused_input_norm:
+            # The kernel normalizes on chip, so it takes the raw sum -- which is
+            # also the residual this layer carries forward.  Same hand-off as
+            # prepare_attn, minus the norm.
+            hidden_states, residual = _fused_ln_residual(hidden_states, residual)
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states,
+                residual,
+                forward_batch,
+                post_residual_addition=post_residual_addition,
+            )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                fused_input_norm=fused_input_norm,
             )
 
         # Fully Connected
