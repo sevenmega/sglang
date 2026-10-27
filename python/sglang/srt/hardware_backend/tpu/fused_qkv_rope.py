@@ -38,6 +38,12 @@ _KERNELS: dict[tuple, object] = {}
 #: runs.  It is not free to grow, though -- rows past the batch are padded work,
 #: so past the token count a wider tile loses badly (T=256: 0.475 ms at 256 vs
 #: 1.691 at 1024).  ``_pick_block_m`` trades the two against each other.
+#:
+#: Those numbers are the norm-fused kernel's.  The projection-only kernel was
+#: spot-checked on the same points and picks the same way -- 12.60 ms at 64 vs
+#: 4.26 ms at 4096 at T=8192, and 1.01 ms at 256 vs 1.57 ms at 1024 at T=256
+#: (it is uniformly faster: it skips the input-norm pass) -- so one table
+#: serves both.
 _BLOCK_M_LADDER = (4096, 2048, 1024, 512, 256, 128, 64)
 _BLOCK_K = 256
 
