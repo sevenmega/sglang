@@ -25,8 +25,11 @@ size gate -- the caller decides.
 
 Size does matter for the win, though, and the flag is a manual switch precisely
 because of it: measured against the torch chain on SG2260E (Qwen3-0.6B,
-``test_fused_mlp.py --sweep``), the fusion is 1.70x at T=8192, 1.61x at 4096,
-1.21x at 2048, 1.40x at 1024, then loses -- 0.83x at T=512 and 0.79x at T=256.
+``test_fused_mlp.py --sweep``, at the ``block_M`` this module picks for each
+size), the fusion is 1.87x at T=8192, 1.87x at 4096, 1.34x at 2048, 1.58x at
+1024, and only loses below that -- 0.92x at T=512 and 0.73x at T=256.  Below a
+few hundred rows the MLP is a pure weight stream that the torch chain spreads
+over all four cores and one row tile cannot.
 Below a few hundred rows the MLP is a pure weight stream that the torch chain
 spreads over all four cores and one row tile cannot.
 """
@@ -46,9 +49,11 @@ _BLOCK_I = 256
 
 #: Reduction tile over ``hidden``, largest first.  ``block_K == hidden`` is the
 #: fastest measured shape: it moves the same bytes as any smaller tile but
-#: issues one DMA per K sweep instead of ``hidden / block_K`` of them
-#: (T=8192: 4.41 ms at 1024 vs 5.00 ms at 256).  The ladder exists only for
-#: hidden sizes that are not multiples of the largest entry.
+#: issues one DMA per K sweep instead of ``hidden / block_K`` of them, and it is
+#: what lets the kernel hoist the activation tile out of the I sweep and keep it
+#: resident (T=1024, block_M=256: 0.728 ms at 1024 vs 0.908 ms at 256).  The
+#: ladder exists only for hidden sizes that are not multiples of the largest
+#: entry.
 _BLOCK_K_LADDER = (1024, 512, 256)
 
 #: Row tile in tokens, taken as the largest one that still gives every core a
