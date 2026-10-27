@@ -95,6 +95,8 @@ class TpuFusedQkvLn(TpuFusedQkvRope):
     raw ``hidden + residual`` (the kernel normalizes it), not a normalized one.
     """
 
+    _kernel_trace_name = "fused_qkv_rope_ln"
+
     def __init__(
         self,
         *,

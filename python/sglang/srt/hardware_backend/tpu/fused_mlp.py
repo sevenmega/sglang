@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.trace import trace_tpu_kernel
+
 #: Compiled kernels, keyed by the full geometry + tile + dtype.  The build is
 #: ~1 minute, so the cache is process-wide and ``__call__`` is the only place
 #: that pays for it.
@@ -191,10 +193,13 @@ class TpuFusedMlp:
         else:
             self._x_pad[:num_tokens] = x
             x_in = self._x_pad
-        kernel(
-            x_in,
-            self._gate_up_proj.weight,
-            self._down_proj.weight,
-            self._y_pad,
-        )
+        with trace_tpu_kernel(
+            "fused_mlp", tokens=num_tokens, padded=padded, block_m=block_m
+        ):
+            kernel(
+                x_in,
+                self._gate_up_proj.weight,
+                self._down_proj.weight,
+                self._y_pad,
+            )
         return self._y_pad[:num_tokens]

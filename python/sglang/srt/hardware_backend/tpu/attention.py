@@ -34,6 +34,7 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.trace import trace_tpu_kernel
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 
 if TYPE_CHECKING:
@@ -652,7 +653,13 @@ class TpuAttnBackend(TorchNativeAttnBackend):
             # The kernel launches with device addresses; run_device_ptrs
             # re-asserts the PPL runtime's device immediately before the launch,
             # so no caller-side _sync_rt_device is needed.
-            res = kernel(q_b, k_b, v_b, mask)  # [1,Hq,q_pad,D] on device
+            with trace_tpu_kernel(
+                "flash_attention_gqa",
+                q=tuple(q_b.shape),
+                kv=tuple(k_b.shape),
+                single_request=True,
+            ):
+                res = kernel(q_b, k_b, v_b, mask)  # [1,Hq,q_pad,D] on device
             _record_flash_launch(
                 batch=1, q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling
             )
@@ -736,7 +743,13 @@ class TpuAttnBackend(TorchNativeAttnBackend):
 
             # Device pointers only: run_device_ptrs re-asserts the runtime's
             # device right before the launch.
-            out = kernel(q_b, k_b, v_b, mask)  # [B, Hq, q_pad, D] on device
+            with trace_tpu_kernel(
+                "flash_attention_gqa",
+                q=tuple(q_b.shape),
+                kv=tuple(k_b.shape),
+                single_request=False,
+            ):
+                out = kernel(q_b, k_b, v_b, mask)  # [B, Hq, q_pad, D] on device
 
             _record_flash_launch(
                 batch=len(qs), q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling
@@ -1077,7 +1090,12 @@ class TpuAttnBackend(TorchNativeAttnBackend):
                 device=q_packed.device,
             ).contiguous()  # [B, q_pad, kv_pad] fp32, on device
 
-            out = kernel(q_packed, k_cache, v_cache, idx, mask, q_off)
+            with trace_tpu_kernel(
+                "flash_attention_paged",
+                q=tuple(q_packed.shape),
+                requests=len(plans),
+            ):
+                out = kernel(q_packed, k_cache, v_cache, idx, mask, q_off)
             _record_flash_launch(
                 batch=len(plans), q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling
             )

@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.trace import trace_tpu_kernel
+
 #: Compiled kernels, keyed by the full geometry + tile + dtype.  The build is
 #: ~1 minute, so the cache is process-wide and the wrap's ``__call__`` is the
 #: only place that pays for it.
@@ -99,6 +101,10 @@ class TpuFusedQkvRope:
     the owning modules, so a weight reload is picked up: the fused table is
     rebuilt whenever either norm weight's storage or in-place version changes.
     """
+
+    #: Name the launch tracer prints; subclasses that add work to the same
+    #: kernel override it so the trace names what actually ran.
+    _kernel_trace_name = "fused_qkv_rope"
 
     def __init__(
         self,
@@ -271,8 +277,21 @@ class TpuFusedQkvRope:
         slots = out_cache_loc.view(1, -1).to(torch.int32)
         kv_row[:, :num_tokens] = slots * (2 * self._num_kv_heads) + rows.view(-1, 1)
 
-        q = kernel(x, self._projection_weight(), cos_rows, self._gamma_table(),
-                   kv_row, k_flat, v_flat)
+        with trace_tpu_kernel(
+            self._kernel_trace_name,
+            tokens=num_tokens,
+            padded=padded,
+            block_m=block_m,
+        ):
+            q = kernel(
+                x,
+                self._projection_weight(),
+                cos_rows,
+                self._gamma_table(),
+                kv_row,
+                k_flat,
+                v_flat,
+            )
         # Same shape contract as ``forward_prepare_native``: the attention
         # backend and ``torch.empty_like(q)`` below it both assume the packed
         # ``[T, num_heads * head_dim]`` layout.
