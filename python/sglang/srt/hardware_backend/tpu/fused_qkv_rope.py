@@ -23,14 +23,32 @@ model checks those once at construction (``_enable_tpu_fused_qkv_rope``), so
 
 from __future__ import annotations
 
+import msgspec
 import torch
 
 from sglang.srt.hardware_backend.tpu.trace import trace_tpu_kernel
+from sglang.srt.model_executor.forward_context import get_attn_backend
 
 #: Compiled kernels, keyed by the full geometry + tile + dtype.  The build is
 #: ~1 minute, so the cache is process-wide and the wrap's ``__call__`` is the
 #: only place that pays for it.
 _KERNELS: dict[tuple, object] = {}
+
+
+class _ForwardRows(msgspec.Struct):
+    """The cos/sin rows and KV write table for one forward, shared by its layers.
+
+    Both depend on the batch alone -- ``positions`` and the paged slots -- so the
+    first layer of a forward builds them and the rest read the same tensors.
+    The source tensors are held so their identities stay unique for the life of
+    the entry (the cache keys on ``id``).
+    """
+
+    positions: torch.Tensor
+    cos_sin_cache: torch.Tensor
+    out_cache_loc: torch.Tensor
+    cos_rows: torch.Tensor
+    kv_row: torch.Tensor
 
 #: Query-row tile in tokens, largest first.  ``block_M`` is the GEMM's M and the
 #: kernel's dominant knob: at T=8192 it is 15.05 ms at 64 vs 5.22 ms at 4096,
@@ -178,8 +196,6 @@ class TpuFusedQkvRope:
         self._v_flat: torch.Tensor | None = None
         self._buf_key: tuple | None = None
         self._x_pad: torch.Tensor | None = None
-        self._cos_pad: torch.Tensor | None = None
-        self._kv_row: torch.Tensor | None = None
 
     # -- per-layer weight preparation ------------------------------------- #
 
@@ -234,29 +250,95 @@ class TpuFusedQkvRope:
     def _padded_buffers(
         self, *, padded: int, hidden_size: int, dtype: torch.dtype, device
     ):
-        """Cached ``X``, ``CosRows`` and ``KVRow`` tiles of ``padded`` rows.
+        """Cached ``X`` tile of ``padded`` rows.
 
-        Rows past the real token count are never rewritten once the buffers
-        exist: they hold whatever the last call with a larger token count left
+        Rows past the real token count are never rewritten once the buffer
+        exists: they hold whatever the last call with a larger token count left
         there, which is safe because a padded row's ``Q`` is sliced off and its
-        ``KV`` goes to the pool's reserved spare slot.  The ``KVRow`` tail is the
-        one exception -- a stale value there would address a *live* slot, so the
-        spare-slot columns are (re)written whenever the buffer is built.
+        ``KV`` goes to the pool's reserved spare slot.
         """
         key = (padded, hidden_size, dtype, device)
         if self._buf_key == key:
             return
-        n_kv = self._num_kv_heads
         self._x_pad = torch.zeros((padded, hidden_size), dtype=dtype, device=device)
-        self._cos_pad = torch.zeros(
+        self._buf_key = key
+
+    def _build_cos_rows(self, *, positions, cos_sin_cache, num_tokens, padded, device):
+        """``[padded, head_dim]`` fp32 cos|sin rows for this batch's positions.
+
+        The cache itself is bf16 once the assembly path has matched the
+        activation dtype, so the copy widens it -- a bf16->fp32 widen has no
+        on-chip instruction, but this is a plain elementwise op on the driver
+        side, not in the kernel.
+        """
+        cos_rows = torch.zeros(
             (padded, self._head_dim), dtype=torch.float32, device=device
         )
-        self._kv_row = torch.zeros((2 * n_kv, padded), dtype=torch.int32, device=device)
+        cos_rows[:num_tokens] = cos_sin_cache.index_select(0, positions.flatten())
+        return cos_rows
+
+    def _build_kv_row(self, *, out_cache_loc, num_tokens, padded, device):
+        """``[2*Hkv, padded]`` int32: each KV head's cache row per token.
+
+        Columns past the batch address the pool's spare slot, or the kernel's
+        padded rows would write into live cache rows; that is why the whole
+        table is seeded with the spare slot before the real columns land.
+        ``out_cache_loc`` is int64 and the kernel reads this table as 32-bit
+        integers, so narrow it here -- an int64 table would be read at half its
+        real stride and yield interleaved garbage rows.
+        """
+        n_kv = self._num_kv_heads
+        kv_row = torch.zeros((2 * n_kv, padded), dtype=torch.int32, device=device)
         rows = torch.arange(2 * n_kv, dtype=torch.int32, device=device)
         # ``_cache_views`` runs first, so the pool's row count is known.
         pad_slot = self._k_flat.shape[0] // (2 * n_kv) - 1
-        self._kv_row[:, :] = rows.view(-1, 1) + pad_slot * (2 * n_kv)
-        self._buf_key = key
+        kv_row[:, :] = rows.view(-1, 1) + pad_slot * (2 * n_kv)
+        slots = out_cache_loc.view(1, -1).to(torch.int32)
+        kv_row[:, :num_tokens] = slots * (2 * n_kv) + rows.view(-1, 1)
+        return kv_row
+
+    def _forward_rows(
+        self, *, positions, cos_sin_cache, out_cache_loc, num_tokens, padded, device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The batch's cos|sin rows and KV write table, built once per forward.
+
+        Neither depends on the layer, so every layer of a forward shares one
+        copy.  Rebuilding them per layer was ten launches a layer: the
+        40960-row cos-table gather, its widen into the fp32 tile, and the table
+        arithmetic behind ``kv_row``.
+        """
+        key = (
+            "qkv_rows",
+            num_tokens,
+            padded,
+            id(positions),
+            id(cos_sin_cache),
+            id(out_cache_loc),
+            str(device),
+        )
+
+        def build() -> _ForwardRows:
+            return _ForwardRows(
+                positions=positions,
+                cos_sin_cache=cos_sin_cache,
+                out_cache_loc=out_cache_loc,
+                cos_rows=self._build_cos_rows(
+                    positions=positions,
+                    cos_sin_cache=cos_sin_cache,
+                    num_tokens=num_tokens,
+                    padded=padded,
+                    device=device,
+                ),
+                kv_row=self._build_kv_row(
+                    out_cache_loc=out_cache_loc,
+                    num_tokens=num_tokens,
+                    padded=padded,
+                    device=device,
+                ),
+            )
+
+        rows = get_attn_backend().forward_glue(key, build)
+        return rows.cos_rows, rows.kv_row
 
     # -- the launch -------------------------------------------------------- #
 
@@ -301,22 +383,16 @@ class TpuFusedQkvRope:
         x = self._x_pad
         x[:num_tokens] = hidden_states
 
-        # [T, head_dim] fp32 cos | sin.  The cache itself is bf16 once the
-        # assembly path has matched the activation dtype, so the copy widens it
-        # -- a bf16->fp32 widen has no on-chip instruction, but this is a plain
-        # elementwise op on the driver side, not in the kernel.
-        cos_rows = self._cos_pad
-        cos_rows[:num_tokens] = cos_sin_cache.index_select(0, positions.flatten())
-
-        kv_row = self._kv_row
-        rows = torch.arange(
-            2 * self._num_kv_heads, dtype=torch.int32, device=out_cache_loc.device
+        # [T, head_dim] fp32 cos | sin, and the KV cache rows for this batch.
+        # Both are the batch's, not the layer's, so a forward builds them once.
+        cos_rows, kv_row = self._forward_rows(
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            out_cache_loc=out_cache_loc,
+            num_tokens=num_tokens,
+            padded=padded,
+            device=hidden_states.device,
         )
-        # ``out_cache_loc`` is int64; the kernel reads this table as 32-bit
-        # integers, so narrow it here -- an int64 table would be read at half its
-        # real stride and yield interleaved garbage rows.
-        slots = out_cache_loc.view(1, -1).to(torch.int32)
-        kv_row[:, :num_tokens] = slots * (2 * self._num_kv_heads) + rows.view(-1, 1)
 
         with trace_tpu_kernel(
             self._kernel_trace_name,

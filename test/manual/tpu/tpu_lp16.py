@@ -1,3 +1,5 @@
+import time
+
 import sglang as sgl
 
 
@@ -11,14 +13,20 @@ def main():
         base_gpu_id=int(__import__("os").environ.get("SGLANG_TPU_DEVICE_ID", "0")),
     )
     for trial in range(2):
+        tic = time.perf_counter()
         out = engine.generate(
             "The capital of France is",
             {"temperature": 0.0, "max_new_tokens": 16},
             return_logprob=True,
         )
+        elapsed = time.perf_counter() - tic
         ids = [t[1] for t in out["meta_info"]["output_token_logprobs"]]
         print(f"trial{trial} TEXT: {out['text']!r}", flush=True)
         print(f"trial{trial} IDS : {ids}", flush=True)
+        print(
+            f"trial{trial} DECODE STEP: {elapsed / 16 * 1000:.1f} ms",
+            flush=True,
+        )
     engine.shutdown()
     print("EXIT=0", flush=True)
 

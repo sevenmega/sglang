@@ -14,6 +14,7 @@ majority.  One process, one generate.
 
 import argparse
 import os
+import time
 
 import sglang as sgl
 
@@ -38,13 +39,21 @@ def main():
         base_gpu_id=int(os.environ.get("SGLANG_TPU_DEVICE_ID", "0")),
     )
     prompt = PARAGRAPH * args.repeat
+    tic = time.perf_counter()
     out = engine.generate(
         prompt,
         {"temperature": 0.0, "max_new_tokens": args.max_new_tokens},
         return_logprob=True,
     )
+    elapsed = time.perf_counter() - tic
     # Printed so a run can be told apart from a short-prompt one.
     print(f"PROMPT TOKENS: {out['meta_info'].get('prompt_tokens')}", flush=True)
+    print(f"GENERATE SECONDS: {elapsed:.3f}", flush=True)
+    print(
+        f"PER STEP: {elapsed / args.max_new_tokens * 1000:.1f} ms "
+        f"(prefill amortized over {args.max_new_tokens} steps)",
+        flush=True,
+    )
     lp = out["meta_info"]["output_token_logprobs"]
     ids = [t[1] for t in lp]
     print(f"IDS : {ids}", flush=True)

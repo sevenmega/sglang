@@ -234,6 +234,36 @@ class _AttnReqPlan(msgspec.Struct, frozen=True):
     req_pool_idx: int  # row of ``req_to_token`` holding its token indices
 
 
+class _PlanEntry(msgspec.Struct):
+    """One batch's attention plans, plus the glue every layer would rebuild.
+
+    The plans and everything derived from them -- the paged row index, the
+    additive mask, the query offsets, the padded query buffer -- depend on the
+    batch, not on the layer.  Rebuilding them per layer costs ~25 aten launches
+    and two host syncs, 27-28 times per step, and the launch overhead is pure
+    waste: the tensors are byte-identical.
+
+    Reuse is bounded two ways: the owner drops its entry table in
+    ``init_forward_metadata`` (once per forward), and an entry is only reused
+    when it holds the very ``seq_lens`` / ``req_pool_indices`` / ``encoder_lens``
+    tensors it was planned from.  Between them a cached mask or index can never
+    outlive the ``req_to_token`` contents it encodes.
+    """
+
+    #: What the plans were read from; a hit requires identity on all three.
+    seq_lens: torch.Tensor
+    req_pool_indices: torch.Tensor
+    encoder_lens: Optional[torch.Tensor]
+    #: Host-side plans, one per request, in batch order.
+    plans: list[_AttnReqPlan]
+    #: Glue derived from ``plans``, keyed by the values that produced it.
+    masks: dict = {}
+    token_index: dict = {}
+    q_offsets: dict = {}
+    buckets: dict = {}
+    padded_query: dict = {}
+
+
 def _as_int_list(x) -> Optional[list[int]]:
     """Materialize a device tensor's values on the host in ONE transfer.
 
@@ -437,6 +467,180 @@ class TpuAttnBackend(TorchNativeAttnBackend):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        # Per-forward attention glue, keyed by (q_lens, is_cross_attn) -- the two
+        # per-layer inputs that can change the plans.  Emptied at the start of
+        # every forward by ``init_forward_metadata``.
+        self._plan_entries: dict[tuple, _PlanEntry] = {}
+        #: Layer-invariant intermediates owned by other drivers of this forward
+        #: (the fused qkv's cos/sin rows and KV write table), keyed by the
+        #: identity of the tensors they were built from.
+        self._forward_glue: dict[tuple, object] = {}
+        #: (tensor, host lens) of the last ``extend_seq_lens`` read this forward.
+        self._extend_lens_read: Optional[tuple] = None
+
+    def init_forward_metadata(self, forward_batch):
+        """Per forward: drop the previous batch's cached attention glue."""
+        super().init_forward_metadata(forward_batch)
+        self._plan_entries = {}
+        self._forward_glue = {}
+        self._extend_lens_read = None
+
+    def forward_glue(self, key: tuple, build):
+        """A per-forward, layer-invariant value, built on first use.
+
+        The fused qkv driver hangs its cos/sin rows and KV write table here:
+        both are the same for every layer of a forward (same positions, same
+        slots), and rebuilding them per layer cost ten launches a layer.  Keys
+        include the identity of the tensors the value was built from, and the
+        value keeps them alive, so a recycled address can never hit.
+        """
+        value = self._forward_glue.get(key)
+        if value is None:
+            value = build()
+            self._forward_glue[key] = value
+        return value
+
+    # ------------------------------------------------------------------
+    # Attention glue: planned once per forward, shared by every layer
+    # ------------------------------------------------------------------
+
+    def _extend_lens(self, extend_seq_lens: torch.Tensor) -> list[int]:
+        """``extend_seq_lens`` as host ints, read off the device once per forward."""
+        read = self._extend_lens_read
+        if read is not None and read[0] is extend_seq_lens:
+            return read[1]
+        lens = _as_int_list(extend_seq_lens)
+        self._extend_lens_read = (extend_seq_lens, lens)
+        return lens
+
+    def _plan_entry(
+        self,
+        *,
+        q_lens: list[int],
+        is_cross_attn: bool,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+    ) -> _PlanEntry:
+        """This batch's plans, resolved on the first layer that asks for them."""
+        key = (tuple(q_lens), is_cross_attn)
+        entry = self._plan_entries.get(key)
+        if (
+            entry is not None
+            and entry.seq_lens is seq_lens
+            and entry.req_pool_indices is req_pool_indices
+            and entry.encoder_lens is encoder_lens
+        ):
+            return entry
+        # One host transfer each, not one per element: indexing a device tensor
+        # element-wise costs a device sync per request.
+        entry = _PlanEntry(
+            seq_lens=seq_lens,
+            req_pool_indices=req_pool_indices,
+            encoder_lens=encoder_lens,
+            plans=_plan_attention_requests(
+                req_pool_indices=_as_int_list(req_pool_indices),
+                seq_lens=_as_int_list(seq_lens),
+                q_lens=q_lens,
+                encoder_lens=_as_int_list(encoder_lens),
+                is_cross_attn=is_cross_attn,
+            ),
+        )
+        self._plan_entries[key] = entry
+        return entry
+
+    @staticmethod
+    def _buckets_for(
+        entry: _PlanEntry, *, n_q_heads: int, n_kv_heads: int
+    ) -> list[list[_AttnReqPlan]]:
+        """``entry``'s plans grouped for batched launches, cached per head pair."""
+        key = (n_q_heads, n_kv_heads)
+        buckets = entry.buckets.get(key)
+        if buckets is None:
+            buckets = _bucket_attention_plans(
+                entry.plans, n_q_heads=n_q_heads, n_kv_heads=n_kv_heads
+            )
+            entry.buckets[key] = buckets
+        return buckets
+
+    @staticmethod
+    def _q_offsets(*, entry, plans, device) -> torch.Tensor:
+        """Each request's first query row, as the kernel's per-request offsets."""
+        key = tuple(plan.q_start for plan in plans)
+        q_off = entry.q_offsets.get(key)
+        if q_off is None:
+            q_off = torch.tensor(list(key), dtype=torch.int32, device=device)
+            entry.q_offsets[key] = q_off
+        return q_off
+
+    def _batched_mask(
+        self, *, entry, plans, q_pad, kv_pad, causal, sliding_window_size, device
+    ) -> torch.Tensor:
+        """The bucket's block-diagonal additive mask, built once per forward."""
+        key = (
+            q_pad,
+            kv_pad,
+            causal,
+            sliding_window_size,
+            tuple((plan.q_len, plan.kv_len) for plan in plans),
+        )
+        mask = entry.masks.get(key)
+        if mask is None:
+            mask = self._build_batched_additive_mask(
+                q_lens=[plan.q_len for plan in plans],
+                kv_lens=[plan.kv_len for plan in plans],
+                q_pad=q_pad,
+                kv_pad=kv_pad,
+                causal=causal,
+                sliding_window_size=sliding_window_size,
+                device=device,
+            ).contiguous()  # [B, q_pad, kv_pad] fp32, on device
+            entry.masks[key] = mask
+        return mask
+
+    def _paged_token_index(
+        self, *, entry, plans, req_to_token, n_kv_heads, kv_pad
+    ) -> torch.Tensor:
+        """The bucket's ``Idx[B, H_kv, kv_pad]``, built once per forward."""
+        key = (
+            kv_pad,
+            n_kv_heads,
+            tuple((plan.kv_start, plan.kv_len, plan.req_pool_idx) for plan in plans),
+        )
+        idx = entry.token_index.get(key)
+        if idx is None:
+            idx = self._build_paged_token_index(
+                plans=plans,
+                req_to_token=req_to_token,
+                n_kv_heads=n_kv_heads,
+                kv_pad=kv_pad,
+            )
+            entry.token_index[key] = idx
+        return idx
+
+    @staticmethod
+    def _padded_query(*, entry, query, max_read):
+        """``query`` grown to ``max_read`` rows, or ``query`` when already that long.
+
+        The kernel's trailing query tile reads up to ``block_M`` rows past the
+        packed buffer with no clamp, so a short batch needs a buffer of at least
+        ``max_read`` rows.  Rows past the real ones are never rewritten and their
+        outputs are discarded, so the zero-filled buffer is built once per bucket
+        instead of being re-allocated and re-zeroed by every layer.
+        """
+        if query.shape[0] >= max_read:
+            return query
+        key = (max_read, *query.shape[1:], query.dtype)
+        padded = entry.padded_query.get(key)
+        if padded is None:
+            padded = torch.zeros(
+                (max_read, *query.shape[1:]),
+                dtype=query.dtype,
+                device=query.device,
+            )
+            entry.padded_query[key] = padded
+        padded[: query.shape[0]] = query
+        return padded
 
     # ------------------------------------------------------------------
     # Core per-request attention math (replaces SDPA)
@@ -1005,6 +1209,7 @@ class TpuAttnBackend(TorchNativeAttnBackend):
     def _attend_plan_bucket_paged(
         self,
         *,
+        entry: _PlanEntry,
         plans: list[_AttnReqPlan],
         query: torch.Tensor,  # [H_q, num_tokens, D]
         output: torch.Tensor,  # [num_tokens, H_q, D]
@@ -1059,36 +1264,30 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         # upper bound of any read; a short decode batch (fewer rows than one
         # tile) is the common case that needs it.
         max_read = max(plan.q_start for plan in plans) + q_pad
-        if q_packed.shape[0] < max_read:
-            padded = torch.zeros(
-                (max_read, *q_packed.shape[1:]),
-                dtype=q_packed.dtype,
-                device=q_packed.device,
-            )
-            padded[: q_packed.shape[0]] = q_packed
-            q_packed = padded
+        q_packed = self._padded_query(
+            entry=entry, query=q_packed, max_read=max_read
+        )
 
         try:
-            idx = self._build_paged_token_index(
+            idx = self._paged_token_index(
+                entry=entry,
                 plans=plans,
                 req_to_token=req_to_token,
                 n_kv_heads=k_cache.shape[1],
                 kv_pad=kv_pad,
             )
-            q_off = torch.tensor(
-                [plan.q_start for plan in plans],
-                dtype=torch.int32,
-                device=q_packed.device,
+            q_off = self._q_offsets(
+                entry=entry, plans=plans, device=q_packed.device
             )
-            mask = self._build_batched_additive_mask(
-                q_lens=q_lens,
-                kv_lens=kv_lens,
+            mask = self._batched_mask(
+                entry=entry,
+                plans=plans,
                 q_pad=q_pad,
                 kv_pad=kv_pad,
                 causal=causal,
                 sliding_window_size=sliding_window_size,
                 device=q_packed.device,
-            ).contiguous()  # [B, q_pad, kv_pad] fp32, on device
+            )
 
             with trace_tpu_kernel(
                 "flash_attention_paged",
@@ -1136,16 +1335,14 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
-        # One host transfer each, not one per element: the planner only needs
-        # these as plain ints, and indexing a device tensor element-wise costs
-        # a device sync per request.
-        plans = _plan_attention_requests(
-            req_pool_indices=_as_int_list(req_pool_indices),
-            seq_lens=_as_int_list(seq_lens),
+        entry = self._plan_entry(
             q_lens=q_lens,
-            encoder_lens=_as_int_list(encoder_lens),
             is_cross_attn=is_cross_attn,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            encoder_lens=encoder_lens,
         )
+        plans = entry.plans
 
         def run_serial(plan_list):
             for plan in plan_list:
@@ -1165,8 +1362,8 @@ class TpuAttnBackend(TorchNativeAttnBackend):
             run_serial(plans)
             return output
 
-        buckets = _bucket_attention_plans(
-            plans, n_q_heads=query.shape[0], n_kv_heads=k_cache.shape[1]
+        buckets = self._buckets_for(
+            entry, n_q_heads=query.shape[0], n_kv_heads=k_cache.shape[1]
         )
         use_paged = envs.SGLANG_TPU_USE_PAGED_FLASH_ATTN.get()
         for bucket in buckets:
@@ -1175,6 +1372,7 @@ class TpuAttnBackend(TorchNativeAttnBackend):
                 # The paged kernel needs no per-request copies, so it is worth a
                 # launch even for a lone request; the gathered path is not.
                 if use_paged and self._attend_plan_bucket_paged(
+                    entry=entry,
                     plans=chunk,
                     query=query,
                     output=output,
@@ -1234,7 +1432,7 @@ class TpuAttnBackend(TorchNativeAttnBackend):
             req_to_token=req_to_token,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            q_lens=_as_int_list(extend_seq_lens),
+            q_lens=self._extend_lens(extend_seq_lens),
             encoder_lens=encoder_lens,
             scaling=scaling,
             causal=causal,
