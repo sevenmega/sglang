@@ -497,6 +497,17 @@ class Envs:
     # (the kernel has no all-reduce), so greedy outputs can differ on near-ties.
     # Only the Qwen3 TPU path is wired; anything else ignores it.
     SGLANG_TPU_USE_FUSED_MLP = EnvBool(False)
+    # Same fusion, plus the layer's ``post_attention_layernorm``: the kernel is
+    # handed ``hidden + residual`` un-normalized and applies the norm on chip,
+    # which also removes the ``prepare_mlp`` boundary (the layer carries that sum
+    # forward as its residual instead of the normed value).  The norm's gamma is
+    # folded into ``gate_up_proj.weight`` on the driver, once per layer.  This
+    # supersedes ``SGLANG_TPU_USE_FUSED_MLP`` when both are on.
+    #
+    # OFF by default, same reasons as above; it additionally moves the fp32
+    # normalization ahead of the projection rather than after a bf16 rounding, so
+    # a greedy near-tie can flip.
+    SGLANG_TPU_USE_FUSED_MLP_LN = EnvBool(False)
     # Log every flash-attention launch (shape + batch size) to stderr, and the
     # deduplicated union plus launch count at process exit. TEMP diagnostic.
     SGLANG_TPU_LOG_FLASH_SHAPES = EnvBool(False)

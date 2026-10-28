@@ -41,6 +41,10 @@ predicate, so a batch the kernel declines shows the torch rows. What it buys is
 the ``[T, I]`` intermediate: the fusion moves X, Y and the weights, and the
 100 MB round trip between the three torch rows is gone.
 
+``SGLANG_TPU_USE_FUSED_MLP_LN=1`` adds the layer's ``post_attention_layernorm`` to
+that kernel (``mlp_fused_ln``) and takes the ``post_attn_norm`` row out of the
+table, since the row it deletes is exactly that launch's round trip.
+
 Before any of that, the script times ``one_batch``'s own prefill step -- its
 module-level ``extend``, the exact region ``latency_test_run_once`` brackets --
 so there is always a number belonging to the real program (batch prep + KV
@@ -51,6 +55,7 @@ Run:
     SGLANG_TPU_DEVICE_ID=5 python3 profile_one_layer.py --batch-size 32 --input-len 256
     PPL_ASYNC_LAUNCH=1 SGLANG_TPU_USE_FUSED_QKV_ROPE=1 python3 profile_one_layer.py
     PPL_ASYNC_LAUNCH=1 SGLANG_TPU_USE_FUSED_QKV_LN=1 python3 profile_one_layer.py
+    PPL_ASYNC_LAUNCH=1 SGLANG_TPU_USE_FUSED_MLP_LN=1 python3 profile_one_layer.py
 """
 
 from __future__ import annotations
@@ -379,47 +384,67 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
     # The fused MLP is the layer's own op -- built once at construction, so the
     # e2e warmup above already paid its compile.  When the flag builds it, the
     # three torch rows collapse into one and the ``[T, I]`` intermediate stops
-    # crossing DDR.
-    fused_mlp = layer._tpu_fused_mlp
+    # crossing DDR.  The norm-fused variant is picked by the model's own
+    # per-forward gate, exactly as ``forward`` picks it.
+    mlp_ln = layer._tpu_fused_mlp_ln_ok(o_out)
+    fused_mlp = layer._tpu_fused_mlp_ln if mlp_ln else layer._tpu_fused_mlp
     mlp_fused = fused_mlp is not None
 
     def run_mlp_fused():
+        # ``o_out`` is the stand-in for the layer's raw ``hidden + residual``:
+        # the profile has no residual stream, and the norm-fused kernel only
+        # needs the tensor it normalizes.
         return fused_mlp(x=o_out)
 
     def run_torch_mlp_chain():
-        gu, _ = mlp.gate_up_proj(o_out)
+        # With the norm folded in, the row this one is read against includes it.
+        x = layer.post_attention_layernorm(o_out) if mlp_ln else o_out
+        gu, _ = mlp.gate_up_proj(x)
         d, _ = mlp.down_proj(mlp.act_fn(gu))
         return d
 
     if fused_mlp is None:
         from sglang.srt.environ import envs
 
-        if envs.SGLANG_TPU_USE_FUSED_MLP.get():
+        if (
+            envs.SGLANG_TPU_USE_FUSED_MLP.get()
+            or envs.SGLANG_TPU_USE_FUSED_MLP_LN.get()
+        ):
             print(
-                "[prof] SGLANG_TPU_USE_FUSED_MLP=1 but this layer failed the "
+                "[prof] a fused-MLP flag is on but this layer failed the "
                 "construction gate -> torch MLP rows, as in the model",
                 flush=True,
             )
-    elif not mlp_fused:
+    elif layer._tpu_fused_mlp_ln is not None and not mlp_ln:
         print(
-            "[prof] SGLANG_TPU_USE_FUSED_MLP=1 but this batch failed the gate "
-            f"(T={T}) -> torch MLP rows, as in the model",
+            "[prof] SGLANG_TPU_USE_FUSED_MLP_LN=1 but this forward failed the "
+            "gate -> plain fused MLP row, norm not folded, as in the model",
             flush=True,
         )
     else:
+        what = (
+            "post_attn_norm + gate_up_proj + silu_mul + down_proj"
+            if mlp_ln
+            else "gate_up_proj + silu_mul + down_proj"
+        )
         print(
-            "[prof] SGLANG_TPU_USE_FUSED_MLP=1 -> gate_up_proj + silu_mul + "
-            "down_proj are measured as one kernel, no [T, I] intermediate",
+            f"[prof] {what} are measured as one kernel, no [T, I] intermediate",
             flush=True,
         )
         print(
-            "[prof] torch equivalent of the fused MLP row, isolated 3 ops: "
+            "[prof] torch equivalent of the fused MLP row, isolated "
+            f"{'4' if mlp_ln else '3'} ops: "
             f"{time_op(run_torch_mlp_chain)*1e6:.1f} us",
             flush=True,
         )
 
-    # X + Y + the whole weight set; the fused op moves no [T, I].
-    mlp_fused_bytes = (2 * I * H + I * H + 2 * T * H) * bpe
+    # X + Y + the whole weight set; the fused op moves no [T, I].  With the norm
+    # folded in, X is read twice (the variance pass and the GEMM) and the gamma
+    # joins the weight stream.
+    mlp_fused_bytes = (
+        (2 * I * H + I * H + (3 if mlp_ln else 2) * T * H) * bpe
+        + (H * bpe if mlp_ln else 0)
+    )
 
     # The fused kernel owns the KV-cache write, so it is not attention's
     # traffic any more.
@@ -447,11 +472,11 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
     if mlp_fused:
         mlp_ops = [
             Op(
-                "mlp_fused",
+                "mlp_fused_ln" if mlp_ln else "mlp_fused",
                 run_mlp_fused,
-                gu_macs + T * I + down_macs,
+                gu_macs + T * I + down_macs + (norm_macs if mlp_ln else 0),
                 mlp_fused_bytes,
-                "+silu_mul",
+                "+post_attn_norm+silu_mul" if mlp_ln else "+silu_mul",
             )
         ]
     else:
@@ -465,8 +490,9 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
         + [
             Op("attn(flash)", run_attn, attn_macs, attn_bytes, "causal; S_kv=T"),
             Op("o_proj", run_oproj, o_macs, o_bytes),
-            Op("post_attn_norm", run_norm, norm_macs, norm_bytes),
         ]
+        # Folded into the fused MLP row when that op took the norm on chip.
+        + ([] if mlp_ln else [Op("post_attn_norm", run_norm, norm_macs, norm_bytes)])
         + mlp_ops
     )
 

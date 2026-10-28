@@ -15,7 +15,9 @@ between them.
 
 ``x`` is the *normalized* hidden state: ``LayerCommunicator.prepare_mlp`` has
 already applied ``post_attention_layernorm`` by the time the layer calls this,
-so the kernel needs no norm of its own.
+so the kernel needs no norm of its own.  ``TpuFusedMlpLn``
+(``fused_mlp_ln.py``) is the opposite contract: it takes the raw sum and folds
+that norm in, and it supersedes this op when its flag is on.
 
 The path is switched by ``SGLANG_TPU_USE_FUSED_MLP`` and gated only on geometry
 at construction time: an unquantized bf16 MLP (the kernel is built for bf16
@@ -30,8 +32,6 @@ size), the fusion is 1.87x at T=8192, 1.87x at 4096, 1.34x at 2048, 1.58x at
 1024, and only loses below that -- 0.92x at T=512 and 0.73x at T=256.  Below a
 few hundred rows the MLP is a pure weight stream that the torch chain spreads
 over all four cores and one row tile cannot.
-Below a few hundred rows the MLP is a pure weight stream that the torch chain
-spreads over all four cores and one row tile cannot.
 """
 
 from __future__ import annotations
@@ -132,6 +132,10 @@ class TpuFusedMlp:
     without a rebuild) and one padded input buffer per token count.
     """
 
+    #: Name the launch tracer prints; subclasses that fold more work into the
+    #: same launch override it so the trace names what actually ran.
+    _kernel_trace_name = "fused_mlp"
+
     def __init__(
         self,
         *,
@@ -147,6 +151,21 @@ class TpuFusedMlp:
         self._x_pad: torch.Tensor | None = None
         self._y_pad: torch.Tensor | None = None
         self._buf_key: tuple | None = None
+
+    # -- kernel selection -------------------------------------------------- #
+
+    def _make_kernel(self, *, hidden_size: int, block_m: int, torch_dtype):
+        """The compiled kernel for this layer's geometry and tile."""
+        return _get_kernel(
+            hidden_size=hidden_size,
+            intermediate_size=self._intermediate_size,
+            block_m=block_m,
+            torch_dtype=torch_dtype,
+        )
+
+    def _projection_weight(self) -> torch.Tensor:
+        """The ``[2I, H]`` gate/up weight the kernel contracts against."""
+        return self._gate_up_proj.weight
 
     def _padded_buffers(
         self, *, padded: int, dtype: torch.dtype, device
@@ -172,14 +191,13 @@ class TpuFusedMlp:
         self._buf_key = key
 
     def __call__(self, *, x: torch.Tensor) -> torch.Tensor:
-        """Return the MLP output for the already-normalized ``x``."""
+        """Return the MLP output for ``x`` -- normalized, for this op."""
         num_tokens, hidden_size = x.shape
         block_m = _pick_block_m(num_tokens)
         padded = -(-num_tokens // block_m) * block_m
 
-        kernel = _get_kernel(
+        kernel = self._make_kernel(
             hidden_size=hidden_size,
-            intermediate_size=self._intermediate_size,
             block_m=block_m,
             torch_dtype=x.dtype,
         )
@@ -199,11 +217,11 @@ class TpuFusedMlp:
             self._x_pad[:num_tokens] = x
             x_in = self._x_pad
         with trace_tpu_kernel(
-            "fused_mlp", tokens=num_tokens, padded=padded, block_m=block_m
+            self._kernel_trace_name, tokens=num_tokens, padded=padded, block_m=block_m
         ):
             kernel(
                 x_in,
-                self._gate_up_proj.weight,
+                self._projection_weight(),
                 self._down_proj.weight,
                 self._y_pad,
             )

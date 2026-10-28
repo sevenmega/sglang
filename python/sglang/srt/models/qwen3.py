@@ -66,6 +66,7 @@ if _is_tpu:
         TpuFusedMlp,
         mlp_geometry_ok,
     )
+    from sglang.srt.hardware_backend.tpu.fused_mlp_ln import TpuFusedMlpLn
     from sglang.srt.hardware_backend.tpu.fused_qkv_ln import TpuFusedQkvLn
     from sglang.srt.hardware_backend.tpu.fused_qkv_rope import (
         TpuFusedQkvRope,
@@ -494,14 +495,15 @@ class Qwen3Attention(nn.Module):
 def _fused_ln_residual(
     hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The residual half of ``prepare_attn``, with the norm left to the kernel.
+    """The residual half of ``prepare_attn`` / ``prepare_mlp``, norm left to a kernel.
 
     Reproduces ``RMSNorm.forward_native``'s arithmetic: the sum is formed in fp32
     and rounded once, so the residual stream stays bit-identical to the torch
     path's instead of drifting a bf16 ulp per layer.  ``residual is None`` (the
-    first layer) and the empty batch mirror ``prepare_attn``: the carried
-    residual is exactly what came in.  ``post_residual_addition`` never reaches
-    here -- the fused path's gate requires it to be None.
+    first layer) and the empty batch mirror ``prepare_*``: the carried residual is
+    exactly what came in.  ``post_residual_addition`` never reaches here: the
+    fused attention path's gate requires it to be None, and ``prepare_mlp`` has
+    no such argument.
     """
     if residual is None or hidden_states.shape[0] == 0:
         return hidden_states, hidden_states
@@ -587,10 +589,89 @@ class Qwen3DecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
         self.self_attn._attach_input_layernorm(self.input_layernorm)
-        self._tpu_fused_mlp = self._build_tpu_fused_mlp(
+        # The norm-fused op supersedes the plain one, exactly as in the attention:
+        # it does everything the plain op does, and building both would compile
+        # two kernels where one will ever run.
+        self._tpu_fused_mlp_ln = self._build_tpu_fused_mlp_ln(
             quant_config=quant_config,
             intermediate_size=config.intermediate_size,
             layer_id=layer_id,
+        )
+        self._tpu_fused_mlp = (
+            None
+            if self._tpu_fused_mlp_ln is not None
+            else self._build_tpu_fused_mlp(
+                quant_config=quant_config,
+                intermediate_size=config.intermediate_size,
+                layer_id=layer_id,
+            )
+        )
+
+    def _tpu_fused_mlp_common_ok(self, *, quant_config, intermediate_size, layer_id):
+        """Gates the plain and the norm-fused MLP op share."""
+        if quant_config is not None:
+            return False
+        if get_parallel().tp_size != 1:
+            # Two reasons, and they are the same gate.  down_proj is row-parallel:
+            # above TP=1 it owns a slice of the I reduction and all-reduces
+            # afterwards, which the kernel does not do.  And prepare_mlp only
+            # reduces to `_simple` -- a residual add plus the norm, nothing else
+            # -- while attn_tp_size is 1, so the norm-fused hand-off below is only
+            # equivalent to it at TP=1.
+            return False
+        if not mlp_geometry_ok(
+            hidden_size=self.hidden_size, intermediate_size=intermediate_size
+        ):
+            logger.warning(
+                "TPU fused MLP disabled for layer %s: geometry (H=%d, I=%d) is "
+                "outside the kernel's contract",
+                layer_id,
+                self.hidden_size,
+                intermediate_size,
+            )
+            return False
+        return True
+
+    def _build_tpu_fused_mlp_ln(
+        self, *, quant_config, intermediate_size: int, layer_id: int
+    ):
+        """The post-attention-norm-fused op, or None to fall back.
+
+        The kernel takes the raw ``hidden + residual`` and applies
+        ``post_attention_layernorm`` itself, so it needs that norm's weight and
+        epsilon; the layer then skips ``prepare_mlp`` instead of running it.
+        """
+        if not (_is_tpu and envs.SGLANG_TPU_USE_FUSED_MLP_LN.get()):
+            return None
+        if not self._tpu_fused_mlp_common_ok(
+            quant_config=quant_config,
+            intermediate_size=intermediate_size,
+            layer_id=layer_id,
+        ):
+            return None
+        return TpuFusedMlpLn(
+            gate_up_proj=self.mlp.gate_up_proj,
+            down_proj=self.mlp.down_proj,
+            post_attention_layernorm=self.post_attention_layernorm,
+            hidden_size=self.hidden_size,
+            intermediate_size=intermediate_size,
+            ln_eps=self.post_attention_layernorm.variance_epsilon,
+        )
+
+    def _tpu_fused_mlp_ln_ok(self, hidden_states) -> bool:
+        """Per-forward gate for the norm-fused op, asked by ``forward``.
+
+        The layer asks because it has to hand over an *unnormalized* sum instead
+        of running ``prepare_mlp``; the answer also picks the op, so the two can
+        never disagree about who normalized.  Everything else is fixed at
+        construction -- ``prepare_mlp`` has no ``post_residual_addition`` and no
+        batch-dependent branch under TP=1 -- so only the activation dtype and the
+        RL fp32-residual variant vary per forward.
+        """
+        return (
+            self._tpu_fused_mlp_ln is not None
+            and hidden_states.dtype == torch.bfloat16
+            and get_exec().deterministic.rl_on_policy_target is None
         )
 
     def _build_tpu_fused_mlp(
@@ -602,25 +683,16 @@ class Qwen3DecoderLayer(nn.Module):
         fixed for the layer's lifetime.  ``prepare_mlp`` normalizes the hidden
         state before the MLP runs, which is exactly what the kernel consumes, so
         no norm is fused in and the layer keeps its ``prepare_mlp`` boundary.
+        ``_build_tpu_fused_mlp_ln`` is the variant that folds that norm in; when
+        it is built this one is not.
         """
         if not (_is_tpu and envs.SGLANG_TPU_USE_FUSED_MLP.get()):
             return None
-        if quant_config is not None:
-            return None
-        if get_parallel().tp_size != 1:
-            # down_proj is row-parallel: above TP=1 it owns a slice of the I
-            # reduction and all-reduces afterwards, which the kernel does not do.
-            return None
-        if not mlp_geometry_ok(
-            hidden_size=self.hidden_size, intermediate_size=intermediate_size
+        if not self._tpu_fused_mlp_common_ok(
+            quant_config=quant_config,
+            intermediate_size=intermediate_size,
+            layer_id=layer_id,
         ):
-            logger.warning(
-                "TPU fused MLP disabled for layer %s: geometry (H=%d, I=%d) is "
-                "outside the kernel's contract",
-                layer_id,
-                self.hidden_size,
-                intermediate_size,
-            )
             return None
         return TpuFusedMlp(
             gate_up_proj=self.mlp.gate_up_proj,
@@ -662,23 +734,34 @@ class Qwen3DecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-            cache=(
-                [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
-                if _is_npu
-                and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                and (
-                    hasattr(self.mlp.gate_up_proj, "weight")
-                    and hasattr(self.mlp.down_proj, "weight")
-                )
-                else None
-            ),
-        )
-        if self._tpu_fused_mlp is not None:
-            hidden_states = self._tpu_fused_mlp(x=hidden_states)
+        fused_mlp_ln = self._tpu_fused_mlp_ln_ok(hidden_states)
+        if fused_mlp_ln:
+            # Same hand-off as the attention above, for prepare_mlp: the kernel
+            # normalizes on chip, so it takes the raw sum -- which is also the
+            # residual this layer carries forward.
+            hidden_states, residual = _fused_ln_residual(hidden_states, residual)
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states,
+                residual,
+                forward_batch,
+                cache=(
+                    [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
+                    if _is_npu
+                    and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                    and (
+                        hasattr(self.mlp.gate_up_proj, "weight")
+                        and hasattr(self.mlp.down_proj, "weight")
+                    )
+                    else None
+                ),
+            )
+        # Keyed on the gate, not on "is the op built": when the gate declines,
+        # prepare_mlp has already normalized and the norm-fused kernel would
+        # normalize a second time.
+        fused_mlp = self._tpu_fused_mlp_ln if fused_mlp_ln else self._tpu_fused_mlp
+        if fused_mlp is not None:
+            hidden_states = fused_mlp(x=hidden_states)
         else:
             hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         if _is_npu and get_cmo_stream():
