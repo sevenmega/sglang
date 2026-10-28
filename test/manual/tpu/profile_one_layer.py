@@ -43,7 +43,24 @@ the ``[T, I]`` intermediate: the fusion moves X, Y and the weights, and the
 
 ``SGLANG_TPU_USE_FUSED_MLP_LN=1`` adds the layer's ``post_attention_layernorm`` to
 that kernel (``mlp_fused_ln``) and takes the ``post_attn_norm`` row out of the
-table, since the row it deletes is exactly that launch's round trip.
+table, since the row it deletes is exactly that launch's round trip. The row is
+then fed the *raw sum* an ``o_proj`` + residual hand-off would produce, not a
+bare projection, because that is what the model gives the kernel.
+
+``SGLANG_TPU_USE_FUSED_OPROJ=1`` (which requires the flag above) replaces the
+``o_proj`` row with the fused ``o_proj`` + residual kernel, which seeds its fp32
+accumulator with the residual. The residual dance it deletes -- four eager aten
+kernels, three full ``[T, H]`` passes and two fp32 temporaries -- has no row of
+its own, so a ``torch residual add after o_proj`` line prices it separately,
+with or without the flag. That cost is why the fusion exists: the GEMM alone is
+not what the boundary costs. This row measures the kernel directly; the model
+applies no size gate, so the same kernel runs at every batch size (and loses to
+the aten chain below ~4096 tokens -- see the flag's comment in ``environ.py``).
+
+``MAC%`` over-reports: ``PEAK_MAC_S`` is the spec sheet's 8 T-MAC/s, while
+``mlp_fused_ln`` demonstrates ~16 T-MAC/s on this part, so a row reading "103 %
+MAC" is at roughly half of what the machine actually does. Judge headroom from
+the ``T-MAC/s`` and ``GB/s`` columns, not the percentages.
 
 Before any of that, the script times ``one_batch``'s own prefill step -- its
 module-level ``extend``, the exact region ``latency_test_run_once`` brackets --
@@ -364,7 +381,49 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
         out, _ = attn.o_proj(attn_out)
         return out
 
-    o_out = run_oproj()
+    proj_out = run_oproj()
+
+    # The residual the layer adds right after o_proj (``_fused_ln_residual``).
+    # The profile carries no residual stream, so the layer's own input stands in
+    # for it -- the same stand-in ``run_mlp_fused`` uses for the raw sum.
+    residual_stand_in = hidden_states
+
+    def run_residual_dance():
+        """The four eager kernels the fused op deletes, verbatim."""
+        return (proj_out.float() + residual_stand_in.float()).to(torch.bfloat16)
+
+    # The layer built this op only alongside the norm-fused MLP, so when it is
+    # present the MLP row below is ``mlp_fused_ln`` and wants the raw sum as its
+    # input -- exactly what this call returns.
+    oproj_res = attn._tpu_oproj_res
+
+    def run_oproj_res():
+        return oproj_res(attn_output=attn_out, residual=residual_stand_in)
+
+    o_out = run_oproj_res() if oproj_res is not None else proj_out
+
+    if oproj_res is not None:
+        print(
+            "[prof] SGLANG_TPU_USE_FUSED_OPROJ=1 -> o_proj is measured as the "
+            "fused o_proj+residual kernel (compiled on the call above, before "
+            "the timed rows)",
+            flush=True,
+        )
+    else:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_TPU_USE_FUSED_OPROJ.get():
+            print(
+                "[prof] SGLANG_TPU_USE_FUSED_OPROJ=1 but this layer failed the "
+                "construction gate (it needs SGLANG_TPU_USE_FUSED_MLP_LN=1) -> "
+                "torch rows, which is what the model would run too",
+                flush=True,
+            )
+    print(
+        "[prof] torch residual add after o_proj, isolated 4 ops: "
+        f"{time_op(run_residual_dance)*1e6:.1f} us",
+        flush=True,
+    )
 
     def run_gate_up():
         gu, _ = mlp.gate_up_proj(o_out)
@@ -391,9 +450,9 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
     mlp_fused = fused_mlp is not None
 
     def run_mlp_fused():
-        # ``o_out`` is the stand-in for the layer's raw ``hidden + residual``:
-        # the profile has no residual stream, and the norm-fused kernel only
-        # needs the tensor it normalizes.
+        # ``o_out`` is the layer's raw ``hidden + residual`` sum: either the
+        # fused o_proj produced it, or the stand-in above stands in for it.  The
+        # norm-fused kernel only needs the tensor it normalizes.
         return fused_mlp(x=o_out)
 
     def run_torch_mlp_chain():
@@ -489,8 +548,23 @@ def build_layer_ops(layer, hidden_states, positions, forward_batch, cfg, ctx) ->
         ops
         + [
             Op("attn(flash)", run_attn, attn_macs, attn_bytes, "causal; S_kv=T"),
-            Op("o_proj", run_oproj, o_macs, o_bytes),
         ]
+        + (
+            [
+                # The residual read and the ``h`` write are the fusion's extra
+                # traffic over the plain GEMM, and the whole point: they replace
+                # the dance, which costs far more than the bytes suggest.
+                Op(
+                    "oproj_res",
+                    run_oproj_res,
+                    o_macs,
+                    o_bytes + T * H * bpe,
+                    "+residual",
+                )
+            ]
+            if oproj_res is not None
+            else [Op("o_proj", run_oproj, o_macs, o_bytes)]
+        )
         # Folded into the fused MLP row when that op took the norm on chip.
         + ([] if mlp_ln else [Op("post_attn_norm", run_norm, norm_macs, norm_bytes)])
         + mlp_ops
@@ -626,11 +700,25 @@ def main():
         import torch as _t
         positions = _t.arange(probe.shape[0], device=dev, dtype=torch.int64)
 
+    # A real residual, not ``None``: past layer 0 the model always has one, and
+    # ``residual is None`` makes the layer skip its residual add entirely (and
+    # the fused o_proj with it), so a ``None`` layer is a layer the model never
+    # runs.  A distinct buffer, since the layer is free to sum into it.
+    residual_probe = probe.clone()
+
     def full_layer():
         with torch.no_grad(), forward_context(ctx):
-            return layer0(positions, probe, fwd, residual=None)
+            return layer0(positions, probe, fwd, residual=residual_probe)
 
     e2e_s = time_op(full_layer)
+    # The probe residual is reused across rounds; a layer that summed into it in
+    # place would time a growing sum, which looks fine and measures nothing.
+    if not torch.equal(residual_probe, probe):
+        print(
+            "[prof] WARNING: the layer mutated its residual argument in place; "
+            "the e2e row below is not a meaningful number",
+            flush=True,
+        )
     print(f"\n[prof] one decoder layer, e2e (serialized): {e2e_s*1e6:.1f} us", flush=True)
 
     # --- per-op breakdown ---------------------------------------------------

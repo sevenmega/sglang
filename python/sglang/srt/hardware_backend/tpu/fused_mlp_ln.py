@@ -13,7 +13,10 @@ The kernel takes ``h`` un-normalized, because that sum is also the value the
 layer carries forward as its next residual -- so folding the norm in removes the
 ``prepare_mlp`` boundary instead of just moving it.  The layer is therefore
 responsible for reproducing ``prepare_mlp``'s residual hand-off; see
-``Qwen3DecoderLayer.forward``.
+``Qwen3DecoderLayer.forward``.  Where ``h`` comes from is the layer's business:
+``_fused_ln_residual`` forms it today, and ``TpuOprojRes`` forms it inside the
+``o_proj`` kernel when that op is live -- both hand over the same raw sum, and
+this op cannot tell which.
 
 The norm's ``gamma`` is folded into the gate/up weight here, once per layer:
 ``gate = rstd * (x . (gamma * Wgu)^T)``, so ``gamma`` is a per-column scale of

@@ -508,6 +508,29 @@ class Envs:
     # normalization ahead of the projection rather than after a bf16 rounding, so
     # a greedy near-tie can flip.
     SGLANG_TPU_USE_FUSED_MLP_LN = EnvBool(False)
+    # Fuse ``o_proj`` with the residual add that follows it: the kernel seeds its
+    # fp32 accumulator with the residual, so ``attn_output @ W_o^T`` never
+    # reaches DRAM and the layer's new hidden state leaves in one narrowing.
+    # The win is the four eager kernels the sum costs today, not the GEMM.
+    #
+    # REQUIRES ``SGLANG_TPU_USE_FUSED_MLP_LN=1``: the kernel's output is the raw
+    # ``hidden + residual`` sum, which only the norm-fused MLP consumes.  With
+    # any other MLP path ``prepare_mlp`` would add the residual a second time, so
+    # the flag is ignored (and no kernel is built) when that MLP is not live.
+    #
+    # Every batch fuses when this is set -- decode included; there is no size
+    # gate.  That is a real cost: below ~4096 tokens the kernel's floor (a launch
+    # plus a 4 MB weight stream) exceeds what the aten chain costs (per layer:
+    # T=64 0.41 ms against 0.22, T=1024 1.10 against 0.84, T=2048 0.80 against
+    # 0.73), and the tile is padded to 1024 rows whatever the batch, so each
+    # decode step pays the ~0.4 ms/layer a T=64 batch does.  Turn it on for
+    # prefill-heavy or prefill/decode-disaggregated deployments only.
+    #
+    # OFF by default for the same reasons as its siblings: a per-shape kernel
+    # build (~1 min) at first use, and the residual is added to the unrounded
+    # fp32 projection where the torch chain rounds it to bf16 first, so greedy
+    # outputs can differ on near-ties.  Only the Qwen3 TPU path is wired.
+    SGLANG_TPU_USE_FUSED_OPROJ = EnvBool(False)
     # Log every flash-attention launch (shape + batch size) to stderr, and the
     # deduplicated union plus launch count at process exit. TEMP diagnostic.
     SGLANG_TPU_LOG_FLASH_SHAPES = EnvBool(False)
