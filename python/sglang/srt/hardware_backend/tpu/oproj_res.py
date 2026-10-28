@@ -27,17 +27,21 @@ change the kernel's ABI), tensor parallelism of one (the kernel does not
 all-reduce), and ``oproj_geometry_ok``.  Nothing else gates it -- with the flag
 set, every batch fuses, decode included, and the caller owns that choice.
 
-That matters because the fusion *loses* below about 4096 tokens: the kernel's
-floor is a launch plus one 4 MB weight stream, which a small batch cannot
-amortize, while the aten kernels it replaces are individually cheap.  Per layer,
-fused against ``mm`` + dance, both at ``_BLOCK_M``: T=16 0.74 ms against 0.26,
-T=1024 1.10 against 0.84, T=2048 0.80 against 0.73, T=4096 0.95 against 1.73,
-T=8192 1.94 against 3.34.  The row tile is padded to ``_BLOCK_M`` whatever the
-batch, so a decode step pays the ~0.74 ms per layer a T=16 batch does -- about
-13 ms across the 27 fused layers, against 7 ms for the aten chain.  Leave the
-flag off unless the deployment is prefill-heavy (or prefill/decode
-disaggregated); the engine has no per-batch switch, so "on" taxes every decode
-step.
+That matters because the fusion *loses* at decode sizes: the kernel's floor is
+a launch plus one 4 MB weight stream, which a small batch cannot amortize.  The
+row tile follows the batch (``_pick_block_m``), which is what keeps that cost
+bounded: at ``block_m=64`` a decode batch costs 0.41 ms per layer instead of
+the 0.74 that padding it to 1024 rows cost.  Per layer, fused against ``mm`` +
+dance, all on one chip and warm (SG2260E; a first call in a process runs ~50 %
+high, which is why single readings disagree): T=1 0.41 ms against 0.22, T=16
+0.41 against 0.27, T=1024 (tile 256) 0.62 against 0.74, T=2048 (tile 512) 0.71
+against 0.72, T=4096 (tile 1024) 0.97 against 1.71, T=8192 1.56 against 3.38.
+So the ladder moves the crossover down to ~2048 tokens; below it the kernel
+loses because a small batch is one row tile on one core while the aten ``mm``
+uses all four, and a decode step pays ~0.41 ms/layer -- ~11 ms across the 27
+fused layers against 7 ms for the aten chain.  Leave the flag off unless the
+deployment is prefill-heavy (or prefill/decode disaggregated); the engine has no
+per-batch switch, so "on" taxes every decode step.
 """
 
 from __future__ import annotations
@@ -56,15 +60,19 @@ _KERNELS: dict[tuple, object] = {}
 #: sweep instead of ``input_size / block_K``.
 _BLOCK_K_LADDER = (1024, 512, 256)
 
-#: Row tile in tokens, baked into the one kernel this op ever builds.  Larger is
-#: better at equal core occupancy -- a tile streams the whole 4 MB weight, so at
-#: T=4096 ``1024`` measures 0.95 ms against 1.05 for ``512``, and at T=8192 1.94
-#: against 2.14 -- and the one size where the smaller tile wins (T=2048: 0.70
-#: against 0.80, because 1024 leaves two cores idle) is not worth a second tile.
-#: Fixed rather than adapted per batch: a second tile in one process means a
-#: second kernel config, and this runtime has been seen to hang initializing
-#: one (see ``test_oproj_res.py``).  Padding covers any batch instead.
-_BLOCK_M = 1024
+#: Row tile in tokens: the largest one that still gives every core a tile, as in
+#: ``TpuFusedMlp``.  At equal core occupancy larger is better -- one tile streams
+#: the whole 4 MB weight, so at T=4096 ``1024`` measures 0.95 ms against 1.05 for
+#: ``512``, and at T=8192 1.94 against 2.14 -- but below ``4 * block_M`` tokens
+#: the tile is pure padding: it streams and pads rows that do not exist, and a
+#: decode step at 1024 rows moves ~10 MB more than the batch needs.  The ladder
+#: picks ``512`` at T=2048, where it measures 0.71 ms against 0.81 for ``1024``.
+#: A second tile per process is safe: ``fused_mlp_ln`` runs ``block_m=64`` and
+#: ``block_m=1024`` side by side in one engine.
+_BLOCK_M_LADDER = (1024, 512, 256, 128, 64)
+
+#: Cores the kernel's grid spreads row tiles over (``T.Kernel(Mt, 1, 4)``).
+_NUM_CORES = 4
 
 #: Columns are aligned to this in the emitter's local-memory accounting, so a
 #: geometry whose widths are not multiples of it would neither pad nor tile
@@ -86,6 +94,14 @@ def _pick_block_k(input_size: int) -> int:
         if input_size % block_k == 0:
             return block_k
     return _BLOCK_K_LADDER[-1]
+
+
+def _pick_block_m(num_tokens: int) -> int:
+    """The largest tile on the ladder that puts a tile on every core."""
+    for block_m in _BLOCK_M_LADDER:
+        if num_tokens >= block_m * _NUM_CORES:
+            return block_m
+    return _BLOCK_M_LADDER[-1]
 
 
 def _get_kernel(
@@ -171,7 +187,7 @@ class TpuOprojRes:
     ) -> torch.Tensor:
         """Return ``attn_output @ W_o^T + residual``, the layer's new hidden state."""
         num_tokens, input_size = attn_output.shape
-        block_m = _BLOCK_M
+        block_m = _pick_block_m(num_tokens)
         padded = -(-num_tokens // block_m) * block_m
 
         kernel = self._make_kernel(
