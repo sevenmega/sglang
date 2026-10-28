@@ -30,12 +30,14 @@ set, every batch fuses, decode included, and the caller owns that choice.
 That matters because the fusion *loses* below about 4096 tokens: the kernel's
 floor is a launch plus one 4 MB weight stream, which a small batch cannot
 amortize, while the aten kernels it replaces are individually cheap.  Per layer,
-fused against ``mm`` + dance: T=64 0.41 ms against 0.22, T=1024 1.10 against
-0.84, T=2048 0.80 against 0.73, T=4096 0.95 against 1.73, T=8192 1.94 against
-3.34.  The row tile is padded to ``_BLOCK_M`` regardless of batch, so a decode
-step costs the same ~0.4 ms per layer a T=64 batch does.  Leave the flag off
-unless the deployment is prefill-heavy (or prefill/decode disaggregated); the
-engine has no per-batch switch, so "on" taxes every decode step.
+fused against ``mm`` + dance, both at ``_BLOCK_M``: T=16 0.74 ms against 0.26,
+T=1024 1.10 against 0.84, T=2048 0.80 against 0.73, T=4096 0.95 against 1.73,
+T=8192 1.94 against 3.34.  The row tile is padded to ``_BLOCK_M`` whatever the
+batch, so a decode step pays the ~0.74 ms per layer a T=16 batch does -- about
+13 ms across the 27 fused layers, against 7 ms for the aten chain.  Leave the
+flag off unless the deployment is prefill-heavy (or prefill/decode
+disaggregated); the engine has no per-batch switch, so "on" taxes every decode
+step.
 """
 
 from __future__ import annotations

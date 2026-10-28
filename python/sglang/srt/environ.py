@@ -520,10 +520,11 @@ class Envs:
     #
     # Every batch fuses when this is set -- decode included; there is no size
     # gate.  That is a real cost: below ~4096 tokens the kernel's floor (a launch
-    # plus a 4 MB weight stream) exceeds what the aten chain costs (per layer:
-    # T=64 0.41 ms against 0.22, T=1024 1.10 against 0.84, T=2048 0.80 against
-    # 0.73), and the tile is padded to 1024 rows whatever the batch, so each
-    # decode step pays the ~0.4 ms/layer a T=64 batch does.  Turn it on for
+    # plus a 4 MB weight stream) exceeds what the aten chain costs (per layer at
+    # the shipped tile: T=16 0.74 ms against 0.26, T=1024 1.10 against 0.84,
+    # T=2048 0.80 against 0.73), and the tile is padded to 1024 rows whatever the
+    # batch, so each decode step pays ~0.74 ms/layer -- about 13 ms across the 27
+    # fused layers, against 7 ms for the aten chain.  Turn it on for
     # prefill-heavy or prefill/decode-disaggregated deployments only.
     #
     # OFF by default for the same reasons as its siblings: a per-shape kernel
