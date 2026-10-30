@@ -1211,7 +1211,7 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         *,
         entry: _PlanEntry,
         plans: list[_AttnReqPlan],
-        query: torch.Tensor,  # [H_q, num_tokens, D]
+        query: torch.Tensor,  # [num_tokens, H_q, D], the packed layout
         output: torch.Tensor,  # [num_tokens, H_q, D]
         k_cache: torch.Tensor,  # [rows, H_kv, D] (NHD, unchanged)
         v_cache: torch.Tensor,
@@ -1228,12 +1228,13 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         request's real output rows. Returns False -- leaving ``output``
         untouched -- whenever the layout is not one the kernel can consume, so
         the caller can use the gathered batch path instead.
+
+        ``query`` arrives in the packed ``[T, H_q, D]`` layout the kernel
+        addresses, not the ``[H_q, T, D]`` one the gathered/serial paths use:
+        the head-major permute their driver applies is undone here otherwise,
+        which is a pair of aten permutes per layer-step for an exact round trip.
         """
-        # The kernel addresses [T, H_q, D] by a per-request row offset, which is
-        # exactly the model's packed query layout: recover it as a view of the
-        # [H_q, T, D] tensor this driver carries. A copy here would cost as much
-        # as the packing this path is meant to remove, so bail out instead.
-        q_packed = query.movedim(0, 1)  # [T, H_q, D]
+        q_packed = query
         if not (q_packed.is_contiguous() and output.is_contiguous()):
             return False
         if not (k_cache.is_contiguous() and v_cache.is_contiguous()):
@@ -1250,9 +1251,10 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         kernel = _get_paged_flash_kernel(d=d, scaling=scaling, dtype=act_dtype)
         if kernel is None:
             return False
+        h_q = query.shape[1]
         for plan in plans:
             _record_flash_shape(
-                hq=query.shape[0], hkv=k_cache.shape[1],
+                hq=h_q, hkv=k_cache.shape[1],
                 q_len=plan.q_len, kv_len=plan.kv_len,
                 q_pad=q_pad, kv_pad=kv_pad, d=d, scaling=scaling,
             )
@@ -1332,6 +1334,10 @@ class TpuAttnBackend(TorchNativeAttnBackend):
         sliding_window_size: Optional[int],
     ) -> torch.Tensor:
         """Shared extend/decode core: plan, bucket, launch, scatter, fall back."""
+        # The paged path addresses the model's packed [num_tokens, num_heads,
+        # head_size] layout directly, so it is handed the tensor as it arrived;
+        # everything else below wants head-major.
+        query_packed = query
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
@@ -1374,7 +1380,7 @@ class TpuAttnBackend(TorchNativeAttnBackend):
                 if use_paged and self._attend_plan_bucket_paged(
                     entry=entry,
                     plans=chunk,
-                    query=query,
+                    query=query_packed,
                     output=output,
                     k_cache=k_cache,
                     v_cache=v_cache,
