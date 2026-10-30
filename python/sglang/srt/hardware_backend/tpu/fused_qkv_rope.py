@@ -353,7 +353,11 @@ class TpuFusedQkvRope:
         v_cache: torch.Tensor,
         eps: float,
     ) -> torch.Tensor:
-        """Return ``q`` as the packed ``[T, num_heads * head_dim]`` bf16 tensor.
+        """Return ``q`` as the kernel's packed ``[padded, num_heads * head_dim]``.
+
+        ``padded`` is ``T`` rounded up to the tile, and only the leading ``T``
+        rows are the batch's -- see the return statement for why the padding is
+        handed back rather than sliced off here.
 
         ``K``/``V`` are already in ``k_cache``/``v_cache`` when this returns;
         rows past ``T`` (the tile padding) write to the pool's spare slot only.
@@ -409,7 +413,15 @@ class TpuFusedQkvRope:
                 k_flat,
                 v_flat,
             )
-        # Same shape contract as ``forward_prepare_native``: the attention
-        # backend and ``torch.empty_like(q)`` below it both assume the packed
-        # ``[T, num_heads * head_dim]`` layout.
-        return q[:num_tokens].reshape(num_tokens, -1)
+        # Hand back the whole padded tile, not ``q[:num_tokens]``.  The paged
+        # attention kernel reads each request's query tile at its true row
+        # offset with no clamp, so it needs a buffer padded to at least the
+        # batch's tile either way: ``_padded_query`` would copy the batch into
+        # its own zero-filled buffer, which at prefill is a whole ``[T, 2048]``
+        # round trip per layer for nothing.  Given the kernel's own buffer it
+        # uses it as it lies.  The padded rows are finite -- ``X``'s pad rows
+        # are zero and never rewritten -- and their attention outputs go to
+        # output rows the scatter never reads, so the caller only has to trim:
+        # ``q[:num_tokens]`` is a view, one op per layer where the slice,
+        # reshape and pad-copy this replaces were four.
+        return q

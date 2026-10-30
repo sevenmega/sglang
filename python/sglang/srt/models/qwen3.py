@@ -579,6 +579,14 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
+        # A fused qkv op hands back its whole padded query tile (the paged
+        # attention kernel needs a padded buffer anyway), so the attention
+        # output carries the same padding; this trims it to the batch's rows.
+        # Nothing else pads, so on every other path the shapes already agree
+        # and this is a single int comparison.
+        num_tokens = hidden_states.shape[0]
+        if attn_output.shape[0] != num_tokens:
+            attn_output = attn_output[:num_tokens]
         if oproj_residual is not None:
             # Only the layer knows whether the norm-fused MLP is live, and it
             # builds this op only in that case, so a residual here implies the op.
