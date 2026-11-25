@@ -47,6 +47,7 @@ __all__ = [
     "is_xpu",
     "register_xpu_device_properties_for_dynamo",
     "is_npu",
+    "is_tpu",
     "is_host_cpu_x86",
     "is_host_cpu_arm64",
     "is_cpu",
@@ -184,6 +185,19 @@ def is_npu() -> bool:
     if not torch.npu.is_available():
         raise RuntimeError(
             "torch_npu detected, but NPU device is not available or visible."
+        )
+
+    return True
+
+
+@lru_cache(maxsize=1)
+def is_tpu() -> bool:
+    if not hasattr(torch, "tpu"):
+        return False
+
+    if not torch.tpu.is_available():
+        raise RuntimeError(
+            "torch_tpu detected, but TPU device is not available or visible."
         )
 
     return True
@@ -536,6 +550,20 @@ def get_available_gpu_memory(
                 free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
         else:
             free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
+    elif device == "tpu":
+        num_gpus = torch.tpu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.tpu.current_device() != gpu_id:
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch TPU context.",
+                gpu_id,
+                torch.tpu.current_device(),
+            )
+        if empty_cache:
+            empty_device_cache(torch.tpu)
+        free_gpu_memory, total_gpu_memory = torch.tpu.mem_get_info(gpu_id)
     elif device == "musa":
         num_gpus = torch.musa.device_count()
         assert gpu_id < num_gpus
@@ -1083,6 +1111,9 @@ def get_device_name(device_id: int = 0) -> str:
 
     if hasattr(torch, "npu") and torch.npu.is_available():
         return torch.npu.get_device_name(device_id)
+
+    if hasattr(torch, "tpu") and torch.tpu.is_available():
+        return torch.tpu.get_device_name(device_id)
 
 
 @lru_cache(maxsize=1)

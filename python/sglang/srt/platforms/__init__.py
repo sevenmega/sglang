@@ -27,6 +27,7 @@ from sglang.srt.platforms.musa import MusaSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.sail import SailSRTPlatform, is_sail_available
+from sglang.srt.platforms.tpu import TpuSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
 
@@ -71,6 +72,12 @@ def _is_mps_available() -> bool:
 
 def _is_mlu_available() -> bool:
     return hasattr(torch, "mlu") and torch.mlu.is_available()
+
+
+def _is_tpu_available() -> bool:
+    return os.getenv("SGLANG_USE_TPU", "0") == "1" or bool(
+        os.environ.get("PPL_PROJECT_ROOT")
+    )
 
 
 def _resolve_platform() -> SRTPlatform:
@@ -160,6 +167,12 @@ def _resolve_platform() -> SRTPlatform:
                 "No platform plugin detected. Using SAIL SRTPlatform defaults."
             )
             return SailSRTPlatform()
+        if _is_tpu_available():
+            logger.debug(
+                "TPU platform detected (SGLANG_USE_TPU=1 or PPL_PROJECT_ROOT set). "
+                "Using TPU SRTPlatform defaults."
+            )
+            return TpuSRTPlatform()
         if _is_cuda_available():
             logger.debug(
                 "No platform plugin detected. Using CUDA SRTPlatform defaults."

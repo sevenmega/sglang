@@ -525,6 +525,106 @@ class Envs:
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
+    # Trace every aten op dispatched to the TPU device (op type + input/output
+    # tensor shapes), via a TorchDispatchMode installed in the TPU platform's
+    # init_backend. Debug-only and very verbose. See hardware_backend/tpu/trace.py.
+    SGLANG_DEBUG_TPU_TRACE = EnvBool(False)
+    # Use the tilelang PPL online-softmax flash-attention kernel for the TPU
+    # attention backend instead of the per-head 2D-matmul loop. On any error
+    # (kernel build/launch) the backend falls back to the torch loop.
+    SGLANG_TPU_USE_FLASH_ATTN = EnvBool(True)
+    # Group the requests of one extend/decode forward by padded shape and give
+    # each group a single flash-attention launch (B = group size) instead of one
+    # launch per request. Requests that cannot be grouped -- or whose group fails
+    # to launch -- still run through the per-request path, so this is a pure
+    # launch-count reduction with the same fallback contract.
+    SGLANG_TPU_USE_BATCHED_FLASH_ATTN = EnvBool(True)
+    # Give each batched flash-attention launch the paged KV cache and the token
+    # index directly instead of a per-request gathered copy of it, and take the
+    # packed queries as they are instead of re-packing them. Removes the driver's
+    # gather/pack/scatter around the kernel; falls back to the gathered path when
+    # the cache layout is incompatible.
+    #
+    # ON by default: it measures faster than the gathered path on the prefill
+    # buckets it was tuned on. The driver no longer materializes [B,H,s_pad,D]
+    # q/k/v copies or a scattered output, and the kernel reads K/V in place out
+    # of the cache. The gathered path is kept as the fallback (and for A/B) --
+    # set this to 0 to force it; ``profile_attn_phases.py --raw`` compares them.
+    SGLANG_TPU_USE_PAGED_FLASH_ATTN = EnvBool(True)
+    # Fuse qkv_proj -> qk-norm -> RoPE -> KV-cache write into one tilelang/PPL
+    # kernel per decoder layer, replacing the ~15 launches the torch chain costs
+    # (linear, split views, two RMSNorms, cos/sin index_select + chunk/mul/add/
+    # cat, two cache scatters). The kernel writes K/V straight into the paged
+    # cache, so the attention backend must be handed ``save_kv_cache=False``.
+    #
+    # OFF by default: it needs a per-shape kernel build (~1 min) at first use,
+    # and its arithmetic normalizes the fp32 projection where the torch path
+    # normalizes a bf16-rounded one, so greedy outputs can differ on near-ties.
+    # Only the Qwen3 TPU path is wired; anything else ignores it.
+    SGLANG_TPU_USE_FUSED_QKV_ROPE = EnvBool(False)
+    # Same fusion, plus the layer's ``input_layernorm``: the kernel is handed
+    # ``hidden + residual`` un-normalized and does the norm on chip, which also
+    # removes the ``prepare_attn`` boundary (the layer carries that sum forward
+    # as its residual instead of the normed value).  This supersedes
+    # ``SGLANG_TPU_USE_FUSED_QKV_ROPE`` when both are on.
+    #
+    # OFF by default, same reasons as above; it additionally changes the fp32
+    # projection into the normalized one, so a greedy near-tie can flip.
+    SGLANG_TPU_USE_FUSED_QKV_LN = EnvBool(False)
+    # Fuse the post-attention MLP -- ``gate_up_proj`` -> ``silu_mul`` ->
+    # ``down_proj`` -- into one kernel that keeps the ``[T, 2I]`` intermediate on
+    # chip.  The win is traffic, not launch count: at T=8192 the two elementwise
+    # rows move ~200 MB of the 330 MB the three ops cost.
+    #
+    # OFF by default: it needs a per-shape kernel build (~1 min) at first use and
+    # only engages for an unquantized bf16 MLP with tensor parallelism of one
+    # (the kernel has no all-reduce), so greedy outputs can differ on near-ties.
+    # Only the Qwen3 TPU path is wired; anything else ignores it.
+    SGLANG_TPU_USE_FUSED_MLP = EnvBool(False)
+    # Same fusion, plus the layer's ``post_attention_layernorm``: the kernel is
+    # handed ``hidden + residual`` un-normalized and applies the norm on chip,
+    # which also removes the ``prepare_mlp`` boundary (the layer carries that sum
+    # forward as its residual instead of the normed value).  The norm's gamma is
+    # folded into ``gate_up_proj.weight`` on the driver, once per layer.  This
+    # supersedes ``SGLANG_TPU_USE_FUSED_MLP`` when both are on.
+    #
+    # OFF by default, same reasons as above; it additionally moves the fp32
+    # normalization ahead of the projection rather than after a bf16 rounding, so
+    # a greedy near-tie can flip.
+    SGLANG_TPU_USE_FUSED_MLP_LN = EnvBool(False)
+    # Fuse ``o_proj`` with the residual add that follows it: the kernel seeds its
+    # fp32 accumulator with the residual, so ``attn_output @ W_o^T`` never
+    # reaches DRAM and the layer's new hidden state leaves in one narrowing.
+    # The win is the four eager kernels the sum costs today, not the GEMM.
+    #
+    # REQUIRES ``SGLANG_TPU_USE_FUSED_MLP_LN=1``: the kernel's output is the raw
+    # ``hidden + residual`` sum, which only the norm-fused MLP consumes.  With
+    # any other MLP path ``prepare_mlp`` would add the residual a second time, so
+    # the flag is ignored (and no kernel is built) when that MLP is not live.
+    #
+    # Every batch fuses when this is set -- decode included; there is no size
+    # gate.  That is a real cost at decode sizes: the kernel's floor (a launch
+    # plus a 4 MB weight stream) exceeds what the aten chain costs, so at the
+    # decoded batch's 64-row tile a decode step pays ~0.41 ms/layer -- ~11 ms
+    # across the 27 fused layers, against 7 ms for the aten chain.  The row tile
+    # follows the batch, which moves the crossover down to ~2048 tokens (per
+    # layer, warm, on one chip: T=16 0.41 ms against 0.27, T=1024 0.62 against
+    # 0.74, T=2048 0.71 against 0.72, T=4096 0.97 against 1.71).  Turn it on for
+    # prefill-heavy or prefill/decode-disaggregated deployments only.
+    #
+    # OFF by default for the same reasons as its siblings: a per-shape kernel
+    # build (~1 min) at first use, and the residual is added to the unrounded
+    # fp32 projection where the torch chain rounds it to bf16 first, so greedy
+    # outputs can differ on near-ties.  Only the Qwen3 TPU path is wired.
+    SGLANG_TPU_USE_FUSED_OPROJ = EnvBool(False)
+    # Log every flash-attention launch (shape + batch size) to stderr, and the
+    # deduplicated union plus launch count at process exit. TEMP diagnostic.
+    SGLANG_TPU_LOG_FLASH_SHAPES = EnvBool(False)
+    # The TPU device this process opens on. This is the authoritative selector:
+    # the TPU platform reconciles base_gpu_id against it during ServerArgs
+    # construction (see TpuSRTPlatform.apply_server_args_defaults), so setting
+    # this alone is enough to pin every entry point to one chip.
+    SGLANG_TPU_DEVICE_ID = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     # Scheduler state checks. BUSY runs the busy pool check (its value also sets

@@ -128,7 +128,8 @@ def get_last_loc(
     uses_triton_dispatch = prefill_backend not in (
         "ascend",
         "torch_native",
-    ) and decode_backend not in ("ascend", "torch_native")
+        "tpu",
+    ) and decode_backend not in ("ascend", "torch_native", "tpu")
 
     if (_is_hip or _is_npu) and uses_triton_dispatch:
         # HIP and NPU DSV4: the legacy get_last_loc_triton kernel emits a

@@ -89,7 +89,10 @@ class SamplerParamsPool:
         host_floats[self.MIN_P] = [p.min_p for p in params]
         rows = async_h2d(slots, dtype=torch.int64, device=self.table.device)
         values = async_h2d_tensor(torch.from_numpy(host_values), self.table.device)
-        self.table.index_copy_(1, rows, values)
+        # Setitem rather than index_copy_: the latter demands a long index, and
+        # torch_tpu materializes an int64 host->device copy as int32, so it
+        # cannot be used on every device that runs this path.
+        self.table[:, rows] = values
 
     def gather(
         self, req_pool_indices: torch.Tensor, req_pool_indices_cpu: torch.Tensor

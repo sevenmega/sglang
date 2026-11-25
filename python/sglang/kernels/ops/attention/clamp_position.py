@@ -49,6 +49,16 @@ class ClampPositionOp(BaseFusedOp):
     }
 
     def forward_native(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.utils.device import is_tpu
+
+        if is_tpu():
+            # On the Sophgo TPU, on-device integer arithmetic on the seq_lens
+            # index tensor is unreliable: ``seq_lens - 1`` / ``clamp`` silently
+            # yields wrong values (a length-6 sequence produced decode position
+            # 0, applying the identity rotation and corrupting every decode
+            # step). Pull the lengths to host and move the int32 result back.
+            positions = [max(length - 1, 0) for length in seq_lens.tolist()]
+            return torch.tensor(positions, dtype=torch.int32, device=seq_lens.device)
         return torch.clamp(seq_lens - 1, min=0).to(torch.int64)
 
     def forward_jit(self, seq_lens: torch.Tensor) -> torch.Tensor:
